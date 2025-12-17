@@ -5,6 +5,16 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
 
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Concurrency {
+    Parallel,
+    Wait,
+    #[default]
+    Skip,
+    Replace,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub jobs: HashMap<String, JobConfig>,
@@ -17,6 +27,8 @@ pub struct JobConfig {
     pub run: String,
     #[serde(default = "default_timeout")]
     pub timeout: String,
+    #[serde(default)]
+    pub concurrency: Concurrency,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +47,7 @@ pub struct Job {
     pub schedule: Schedule,
     pub command: String,
     pub timeout: Duration,
+    pub concurrency: Concurrency,
 }
 
 pub fn parse_config(content: &str) -> Result<Vec<Job>> {
@@ -60,6 +73,7 @@ pub fn parse_config(content: &str) -> Result<Vec<Job>> {
                 schedule,
                 command: job.run,
                 timeout,
+                concurrency: job.concurrency,
             })
         })
         .collect()
@@ -152,5 +166,52 @@ jobs:
         assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
         assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
         assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn parse_concurrency_default() {
+        let yaml = r#"
+jobs:
+  test:
+    schedule:
+      cron: "* * * * *"
+    run: echo test
+"#;
+        let jobs = parse_config(yaml).unwrap();
+        assert_eq!(jobs[0].concurrency, Concurrency::Skip);
+    }
+
+    #[test]
+    fn parse_concurrency_all_variants() {
+        let yaml = r#"
+jobs:
+  parallel_job:
+    schedule:
+      cron: "* * * * *"
+    run: echo 1
+    concurrency: parallel
+  wait_job:
+    schedule:
+      cron: "* * * * *"
+    run: echo 2
+    concurrency: wait
+  skip_job:
+    schedule:
+      cron: "* * * * *"
+    run: echo 3
+    concurrency: skip
+  replace_job:
+    schedule:
+      cron: "* * * * *"
+    run: echo 4
+    concurrency: replace
+"#;
+        let jobs = parse_config(yaml).unwrap();
+        let find = |id: &str| jobs.iter().find(|j| j.id == id).unwrap();
+
+        assert_eq!(find("parallel_job").concurrency, Concurrency::Parallel);
+        assert_eq!(find("wait_job").concurrency, Concurrency::Wait);
+        assert_eq!(find("skip_job").concurrency, Concurrency::Skip);
+        assert_eq!(find("replace_job").concurrency, Concurrency::Replace);
     }
 }

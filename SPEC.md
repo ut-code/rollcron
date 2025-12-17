@@ -48,7 +48,17 @@ jobs:
       cron: "<cron-expr>"      # Required: 5-field cron expression
     run: <string>              # Required: shell command to execute
     timeout: <duration>        # Optional: default "10s"
+    concurrency: <strategy>    # Optional: default "skip"
 ```
+
+### Concurrency Strategies
+
+| Strategy | Behavior |
+|----------|----------|
+| `parallel` | Allow concurrent runs |
+| `wait` | Wait for previous run to complete |
+| `skip` | Skip if previous run still active (default) |
+| `replace` | Kill previous run, start new |
 
 ### Example
 
@@ -60,11 +70,13 @@ jobs:
       cron: "0 * * * *"
     run: cargo build --release
     timeout: 5m
+    concurrency: wait
 
   health-check:
     schedule:
       cron: "*/5 * * * *"
     run: curl -f http://localhost/health
+    concurrency: skip
 ```
 
 ### Cron Expression

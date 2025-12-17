@@ -1,13 +1,20 @@
-use crate::config::Job;
+use crate::config::{Concurrency, Job};
 use crate::git;
 use anyhow::Result;
 use chrono::Utc;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 pub async fn run_scheduler(jobs: Vec<Job>, sot_path: PathBuf) -> Result<()> {
+    let running: Arc<Mutex<HashMap<String, Vec<JoinHandle<()>>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
     loop {
         let now = Utc::now();
 
@@ -15,17 +22,84 @@ pub async fn run_scheduler(jobs: Vec<Job>, sot_path: PathBuf) -> Result<()> {
             if let Some(next) = job.schedule.upcoming(Utc).next() {
                 let until_next = (next - now).num_milliseconds();
                 if until_next <= 1000 && until_next >= 0 {
-                    let job = job.clone();
                     let work_dir = git::get_job_dir(&sot_path, &job.id);
-                    tokio::spawn(async move {
-                        execute_job(&job, &work_dir).await;
-                    });
+                    handle_job_trigger(job, work_dir, &running).await;
                 }
             }
         }
 
         sleep(Duration::from_secs(1)).await;
     }
+}
+
+async fn handle_job_trigger(
+    job: &Job,
+    work_dir: PathBuf,
+    running: &Arc<Mutex<HashMap<String, Vec<JoinHandle<()>>>>>,
+) {
+    let tag = format!("[job:{}]", job.id);
+    let mut map = running.lock().await;
+
+    // Clean up finished jobs
+    if let Some(handles) = map.get_mut(&job.id) {
+        handles.retain(|h| !h.is_finished());
+        if handles.is_empty() {
+            map.remove(&job.id);
+        }
+    }
+
+    let running_count = map.get(&job.id).map(|v| v.len()).unwrap_or(0);
+
+    match job.concurrency {
+        Concurrency::Parallel => {
+            spawn_job(job, work_dir, &mut map);
+        }
+        Concurrency::Wait => {
+            if running_count > 0 {
+                println!("{} Waiting for {} previous run(s) to complete", tag, running_count);
+                let handles = map.remove(&job.id).unwrap();
+                drop(map); // Release lock while waiting
+                for handle in handles {
+                    let _ = handle.await;
+                }
+                let mut map = running.lock().await;
+                spawn_job(job, work_dir, &mut map);
+            } else {
+                spawn_job(job, work_dir, &mut map);
+            }
+        }
+        Concurrency::Skip => {
+            if running_count > 0 {
+                println!("{} Skipped ({} instance(s) still active)", tag, running_count);
+            } else {
+                spawn_job(job, work_dir, &mut map);
+            }
+        }
+        Concurrency::Replace => {
+            if running_count > 0 {
+                println!("{} Replacing {} previous run(s)", tag, running_count);
+                let handles = map.remove(&job.id).unwrap();
+                for handle in handles {
+                    handle.abort();
+                }
+            }
+            spawn_job(job, work_dir, &mut map);
+        }
+    }
+}
+
+fn spawn_job(
+    job: &Job,
+    work_dir: PathBuf,
+    map: &mut HashMap<String, Vec<JoinHandle<()>>>,
+) {
+    let job_id = job.id.clone();
+    let job = job.clone();
+    let handle = tokio::spawn(async move {
+        execute_job(&job, &work_dir).await;
+    });
+
+    map.entry(job_id).or_default().push(handle);
 }
 
 async fn execute_job(job: &Job, work_dir: &PathBuf) {
@@ -101,6 +175,7 @@ mod tests {
             schedule: Schedule::from_str("* * * * * *").unwrap(),
             command: cmd.to_string(),
             timeout: Duration::from_secs(timeout_secs),
+            concurrency: Concurrency::Skip,
         }
     }
 
