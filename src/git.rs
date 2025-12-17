@@ -132,24 +132,43 @@ pub fn sync_to_job_dir(sot_path: &Path, job_dir: &Path) -> Result<()> {
     }
     std::fs::create_dir_all(job_dir)?;
 
-    let archive = Command::new("git")
-        .args(["archive", "HEAD"])
-        .current_dir(sot_path)
-        .output()?;
+    // Check if .git exists (remote repos have it, local rsync'd repos don't)
+    if sot_path.join(".git").exists() {
+        // Use git archive for git repos
+        let archive = Command::new("git")
+            .args(["archive", "HEAD"])
+            .current_dir(sot_path)
+            .output()?;
 
-    if !archive.status.success() {
-        let stderr = String::from_utf8_lossy(&archive.stderr);
-        anyhow::bail!("git archive failed: {}", stderr);
+        if !archive.status.success() {
+            let stderr = String::from_utf8_lossy(&archive.stderr);
+            anyhow::bail!("git archive failed: {}", stderr);
+        }
+
+        let extract = Command::new("tar")
+            .args(["-x"])
+            .current_dir(job_dir)
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+
+        use std::io::Write;
+        extract.stdin.unwrap().write_all(&archive.stdout)?;
+    } else {
+        // For non-git dirs (rsync'd local repos), use rsync
+        let output = Command::new("rsync")
+            .args([
+                "-a",
+                "--delete",
+                &format!("{}/", sot_path.to_str().unwrap()),
+                job_dir.to_str().unwrap(),
+            ])
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("rsync failed: {}", stderr);
+        }
     }
-
-    let extract = Command::new("tar")
-        .args(["-x"])
-        .current_dir(job_dir)
-        .stdin(std::process::Stdio::piped())
-        .spawn()?;
-
-    use std::io::Write;
-    extract.stdin.unwrap().write_all(&archive.stdout)?;
 
     Ok(())
 }
