@@ -78,11 +78,13 @@ jobs:
       cron: "* * * * *"       # Cron expression (5 fields)
     run: command              # Shell command
     timeout: 10s              # Optional (default: 10s)
+    jitter: 30s               # Optional: random delay 0-30s before execution
     concurrency: skip         # Optional: parallel|wait|skip|replace (default: skip)
     working_dir: ./subdir     # Optional: working directory (relative to job snapshot dir)
     retry:                    # Optional
       max: 3                  # Max retry attempts
       delay: 1s               # Initial delay (default: 1s), exponential backoff
+      jitter: 500ms           # Optional: random variation (default: 25% of delay)
 ```
 
 ### Runner
@@ -104,14 +106,22 @@ Controls behavior when a job is triggered while a previous instance is still run
 | `skip` | Skip this trigger (default) |
 | `replace` | Kill running instance, start new one |
 
+### Jitter
+
+Random delay to prevent thundering herd problems:
+
+- **Task jitter**: Random delay (0 to `jitter`) before job execution
+- **Retry jitter**: Random variation added to backoff delay (defaults to 25% of delay if not specified)
+
 ### Retry
 
 Jobs can automatically retry on failure with exponential backoff:
 
 ```yaml
 retry:
-  max: 3      # Retry up to 3 times
-  delay: 2s   # Initial delay (doubles each retry: 2s, 4s, 8s)
+  max: 3        # Retry up to 3 times
+  delay: 2s     # Initial delay (doubles each retry: 2s, 4s, 8s)
+  jitter: 500ms # Optional: random variation (default: 25% of delay)
 ```
 
 ### Cron Expression
@@ -130,8 +140,9 @@ Examples:
 - `0 0 * * *` - daily at midnight
 - `0 0 * * 0` - weekly on Sunday
 
-### Timeout
+### Duration Format
 
+- `500ms` - 500 milliseconds
 - `30s` - 30 seconds
 - `5m` - 5 minutes
 - `1h` - 1 hour
