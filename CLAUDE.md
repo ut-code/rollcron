@@ -24,6 +24,13 @@ struct Job {
     schedule: cron::Schedule,
     command: String,
     timeout: Duration,
+    concurrency: Concurrency,
+    retry: Option<RetryConfig>,
+}
+
+struct RetryConfig {
+    max: u32,             // Max retry attempts
+    delay: Duration,      // Initial delay (exponential backoff)
 }
 
 // Parsed from rollcron.yaml
@@ -42,6 +49,10 @@ jobs:
       cron: "*/5 * * * *"
     run: echo hello
     timeout: 10s             # Optional (default: 10s)
+    concurrency: skip        # Optional: parallel|wait|skip|replace (default: skip)
+    retry:                   # Optional
+      max: 3                 # Max retry attempts
+      delay: 1s              # Initial delay (default: 1s), exponential backoff
 ```
 
 ## Runtime Directory Layout

@@ -29,6 +29,19 @@ pub struct JobConfig {
     pub timeout: String,
     #[serde(default)]
     pub concurrency: Concurrency,
+    pub retry: Option<RetryConfigRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RetryConfigRaw {
+    #[serde(default)]
+    pub max: u32,
+    #[serde(default = "default_retry_delay")]
+    pub delay: String,
+}
+
+fn default_retry_delay() -> String {
+    "1s".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +61,13 @@ pub struct Job {
     pub command: String,
     pub timeout: Duration,
     pub concurrency: Concurrency,
+    pub retry: Option<RetryConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    pub max: u32,
+    pub delay: Duration,
 }
 
 pub fn parse_config(content: &str) -> Result<Vec<Job>> {
@@ -67,6 +87,15 @@ pub fn parse_config(content: &str) -> Result<Vec<Job>> {
 
             let name = job.name.unwrap_or_else(|| id.clone());
 
+            let retry = job
+                .retry
+                .map(|r| {
+                    let delay = parse_duration(&r.delay)
+                        .map_err(|e| anyhow!("Invalid retry delay '{}' in job '{}': {}", r.delay, id, e))?;
+                    Ok::<_, anyhow::Error>(RetryConfig { max: r.max, delay })
+                })
+                .transpose()?;
+
             Ok(Job {
                 id,
                 name,
@@ -74,6 +103,7 @@ pub fn parse_config(content: &str) -> Result<Vec<Job>> {
                 command: job.run,
                 timeout,
                 concurrency: job.concurrency,
+                retry,
             })
         })
         .collect()
@@ -213,5 +243,48 @@ jobs:
         assert_eq!(find("wait_job").concurrency, Concurrency::Wait);
         assert_eq!(find("skip_job").concurrency, Concurrency::Skip);
         assert_eq!(find("replace_job").concurrency, Concurrency::Replace);
+    }
+
+    #[test]
+    fn parse_retry_config() {
+        let yaml = r#"
+jobs:
+  with_retry:
+    schedule:
+      cron: "* * * * *"
+    run: echo test
+    retry:
+      max: 3
+      delay: 2s
+  no_retry:
+    schedule:
+      cron: "* * * * *"
+    run: echo test
+"#;
+        let jobs = parse_config(yaml).unwrap();
+        let find = |id: &str| jobs.iter().find(|j| j.id == id).unwrap();
+
+        let retry = find("with_retry").retry.as_ref().unwrap();
+        assert_eq!(retry.max, 3);
+        assert_eq!(retry.delay, Duration::from_secs(2));
+
+        assert!(find("no_retry").retry.is_none());
+    }
+
+    #[test]
+    fn parse_retry_default_delay() {
+        let yaml = r#"
+jobs:
+  test:
+    schedule:
+      cron: "* * * * *"
+    run: echo test
+    retry:
+      max: 2
+"#;
+        let jobs = parse_config(yaml).unwrap();
+        let retry = jobs[0].retry.as_ref().unwrap();
+        assert_eq!(retry.max, 2);
+        assert_eq!(retry.delay, Duration::from_secs(1)); // default delay
     }
 }

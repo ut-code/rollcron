@@ -1,4 +1,4 @@
-use crate::config::{Concurrency, Job};
+use crate::config::{Concurrency, Job, RetryConfig};
 use crate::git;
 use anyhow::Result;
 use chrono::Utc;
@@ -104,10 +104,36 @@ fn spawn_job(
 
 async fn execute_job(job: &Job, work_dir: &PathBuf) {
     let tag = format!("[job:{}]", job.id);
+    let max_attempts = job.retry.as_ref().map(|r| r.max + 1).unwrap_or(1);
 
-    println!("{} Starting '{}'", tag, job.name);
-    println!("{}   command: {}", tag, job.command);
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            let delay = calculate_backoff(job.retry.as_ref().unwrap(), attempt - 1);
+            println!("{} Retry {}/{} after {:?}", tag, attempt, max_attempts - 1, delay);
+            sleep(delay).await;
+        }
 
+        println!("{} Starting '{}'", tag, job.name);
+        println!("{}   command: {}", tag, job.command);
+
+        let result = run_command(job, work_dir).await;
+        let success = handle_result(&tag, job, &result);
+
+        if success {
+            return;
+        }
+
+        if attempt + 1 < max_attempts {
+            println!("{} Will retry...", tag);
+        }
+    }
+}
+
+fn calculate_backoff(retry: &RetryConfig, attempt: u32) -> Duration {
+    retry.delay.saturating_mul(2u32.saturating_pow(attempt))
+}
+
+async fn run_command(job: &Job, work_dir: &PathBuf) -> CommandResult {
     let result = tokio::time::timeout(job.timeout, async {
         tokio::task::spawn_blocking({
             let cmd = job.command.clone();
@@ -124,7 +150,23 @@ async fn execute_job(job: &Job, work_dir: &PathBuf) {
     .await;
 
     match result {
-        Ok(Ok(Ok(output))) => {
+        Ok(Ok(Ok(output))) => CommandResult::Completed(output),
+        Ok(Ok(Err(e))) => CommandResult::ExecError(e.to_string()),
+        Ok(Err(e)) => CommandResult::TaskError(e.to_string()),
+        Err(_) => CommandResult::Timeout,
+    }
+}
+
+enum CommandResult {
+    Completed(std::process::Output),
+    ExecError(String),
+    TaskError(String),
+    Timeout,
+}
+
+fn handle_result(tag: &str, job: &Job, result: &CommandResult) -> bool {
+    match result {
+        CommandResult::Completed(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -135,6 +177,7 @@ async fn execute_job(job: &Job, work_dir: &PathBuf) {
                         println!("{}   | {}", tag, line);
                     }
                 }
+                true
             } else {
                 eprintln!("{} ✗ Failed (exit code: {:?})", tag, output.status.code());
                 if !stderr.trim().is_empty() {
@@ -147,16 +190,20 @@ async fn execute_job(job: &Job, work_dir: &PathBuf) {
                         eprintln!("{}   | {}", tag, line);
                     }
                 }
+                false
             }
         }
-        Ok(Ok(Err(e))) => {
+        CommandResult::ExecError(e) => {
             eprintln!("{} ✗ Failed to execute: {}", tag, e);
+            false
         }
-        Ok(Err(e)) => {
+        CommandResult::TaskError(e) => {
             eprintln!("{} ✗ Task error: {}", tag, e);
+            false
         }
-        Err(_) => {
+        CommandResult::Timeout => {
             eprintln!("{} ✗ Timeout after {:?}", tag, job.timeout);
+            false
         }
     }
 }
@@ -176,6 +223,7 @@ mod tests {
             command: cmd.to_string(),
             timeout: Duration::from_secs(timeout_secs),
             concurrency: Concurrency::Skip,
+            retry: None,
         }
     }
 
@@ -191,5 +239,45 @@ mod tests {
         let job = make_job("sleep 10", 1);
         let dir = tempdir().unwrap();
         execute_job(&job, &dir.path().to_path_buf()).await;
+    }
+
+    #[test]
+    fn exponential_backoff_calculation() {
+        let retry = RetryConfig {
+            max: 5,
+            delay: Duration::from_secs(1),
+        };
+        assert_eq!(calculate_backoff(&retry, 0), Duration::from_secs(1));
+        assert_eq!(calculate_backoff(&retry, 1), Duration::from_secs(2));
+        assert_eq!(calculate_backoff(&retry, 2), Duration::from_secs(4));
+        assert_eq!(calculate_backoff(&retry, 3), Duration::from_secs(8));
+    }
+
+    #[tokio::test]
+    async fn job_retry_on_failure() {
+        let mut job = make_job("exit 1", 10);
+        job.retry = Some(RetryConfig {
+            max: 2,
+            delay: Duration::from_millis(10),
+        });
+        let dir = tempdir().unwrap();
+        let start = std::time::Instant::now();
+        execute_job(&job, &dir.path().to_path_buf()).await;
+        // Should have waited at least 10ms + 20ms = 30ms for 2 retries
+        assert!(start.elapsed() >= Duration::from_millis(30));
+    }
+
+    #[tokio::test]
+    async fn job_success_no_retry() {
+        let mut job = make_job("echo ok", 10);
+        job.retry = Some(RetryConfig {
+            max: 3,
+            delay: Duration::from_millis(100),
+        });
+        let dir = tempdir().unwrap();
+        let start = std::time::Instant::now();
+        execute_job(&job, &dir.path().to_path_buf()).await;
+        // Should complete quickly without retries
+        assert!(start.elapsed() < Duration::from_millis(100));
     }
 }
