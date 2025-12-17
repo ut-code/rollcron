@@ -14,7 +14,6 @@ const CONFIG_FILE: &str = "rollcron.yaml";
 #[command(name = "rollcron", about = "Auto-pulling cron scheduler")]
 struct Args {
     /// Path to local repo or remote URL (https://... or git@...)
-    #[arg(default_value = ".")]
     repo: String,
 
     /// Pull interval in seconds

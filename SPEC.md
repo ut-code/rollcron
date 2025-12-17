@@ -124,14 +124,14 @@ Examples:
 ## CLI Interface
 
 ```
-rollcron [OPTIONS] [REPO]
+rollcron [OPTIONS] <REPO>
 
 Arguments:
-  [REPO]  Path to local repo or remote URL [default: .]
+  <REPO>  Path to local repo or remote URL (required)
 
 Options:
-  -i, --interval <SECONDS>  Pull interval [default: 60]
-  -h, --help               Print help
+  --pull-interval <SECONDS>  Pull interval [default: 3600]
+  -h, --help                 Print help
 ```
 
 ## Error Handling
