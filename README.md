@@ -14,13 +14,13 @@ cargo install --path .
 
 ```bash
 # Run directly
-nix run github:aster-void/rollcron -- /path/to/repo
+nix run github:ut-code/rollcron -- /path/to/repo
 
 # Install
-nix profile install github:aster-void/rollcron
+nix profile install github:ut-code/rollcron
 
 # Open a shell
-nix shell github:aster-void/rollcron
+nix shell github:ut-code/rollcron
 ```
 
 I recommend installing this via https://github.com/aster-void/nix-repository for build cache.
@@ -55,6 +55,12 @@ rollcron https://github.com/user/my-cron-jobs
 
 # Custom pull interval (5 minutes)
 rollcron https://github.com/user/repo --pull-interval 300
+```
+
+or, use this repo:
+
+```sh
+rollcron https://github.com/ut-code/rollcron
 ```
 
 ## Configuration

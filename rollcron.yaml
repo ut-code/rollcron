@@ -1,5 +1,9 @@
 jobs:
   health-check:
     schedule:
-      cron: "* * * * *"
-    run: echo "updated" 2
+      cron: "*/5 * * * *"
+    run: echo Hello from rollcron!
+  wc-readme:
+    schedule:
+      cron: "*/5 * * * *"
+    run: wc ./README.md
