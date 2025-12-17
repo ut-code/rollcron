@@ -26,16 +26,19 @@ struct Job {
     timeout: Duration,
     concurrency: Concurrency,
     retry: Option<RetryConfig>,
+    jitter: Option<Duration>,  // Random delay before execution (0 to jitter)
 }
 
 struct RetryConfig {
     max: u32,             // Max retry attempts
     delay: Duration,      // Initial delay (exponential backoff)
+    jitter: Option<Duration>,  // Random variation added to retry delay (0 to jitter)
+                               // Auto-inferred as 25% of delay when not set
 }
 
 // Parsed from rollcron.yaml
 struct Config { jobs: HashMap<String, JobConfig> }
-struct JobConfig { name: Option<String>, schedule: ScheduleConfig, run, timeout }
+struct JobConfig { name: Option<String>, schedule: ScheduleConfig, run, timeout, jitter }
 struct ScheduleConfig { cron: String }
 ```
 
@@ -49,10 +52,13 @@ jobs:
       cron: "*/5 * * * *"
     run: echo hello
     timeout: 10s             # Optional (default: 10s)
+    jitter: 30s              # Optional: random delay 0-30s before execution
     concurrency: skip        # Optional: parallel|wait|skip|replace (default: skip)
     retry:                   # Optional
       max: 3                 # Max retry attempts
       delay: 1s              # Initial delay (default: 1s), exponential backoff
+      jitter: 500ms          # Optional: random variation 0-500ms added to retry delay
+                             # If omitted, auto-inferred as 25% of delay (e.g., 250ms for 1s delay)
 ```
 
 ## Runtime Directory Layout
@@ -92,7 +98,9 @@ jobs:
 1. Scheduler polls every 1 second
 2. Check each job's cron schedule
 3. If due: spawn task in job's directory (by ID) with timeout
-4. Log using display name
+4. Apply task jitter (random delay 0 to jitter) before first execution
+5. On failure: apply exponential backoff + retry jitter before retry
+6. Log using display name
 
 ## Constraints
 

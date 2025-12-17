@@ -44,6 +44,7 @@ pub struct JobConfig {
     pub concurrency: Concurrency,
     pub retry: Option<RetryConfigRaw>,
     pub working_dir: Option<String>,
+    pub jitter: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,6 +53,7 @@ pub struct RetryConfigRaw {
     pub max: u32,
     #[serde(default = "default_retry_delay")]
     pub delay: String,
+    pub jitter: Option<String>,
 }
 
 fn default_retry_delay() -> String {
@@ -77,12 +79,14 @@ pub struct Job {
     pub concurrency: Concurrency,
     pub retry: Option<RetryConfig>,
     pub working_dir: Option<String>,
+    pub jitter: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
     pub max: u32,
     pub delay: Duration,
+    pub jitter: Option<Duration>,
 }
 
 pub fn parse_config(content: &str) -> Result<(RunnerConfig, Vec<Job>)> {
@@ -116,8 +120,18 @@ pub fn parse_config(content: &str) -> Result<(RunnerConfig, Vec<Job>)> {
                 .map(|r| {
                     let delay = parse_duration(&r.delay)
                         .map_err(|e| anyhow!("Invalid retry delay '{}' in job '{}': {}", r.delay, id, e))?;
-                    Ok::<_, anyhow::Error>(RetryConfig { max: r.max, delay })
+                    let jitter = r.jitter
+                        .map(|j| parse_duration(&j)
+                            .map_err(|e| anyhow!("Invalid retry jitter '{}' in job '{}': {}", j, id, e)))
+                        .transpose()?;
+                    Ok::<_, anyhow::Error>(RetryConfig { max: r.max, delay, jitter })
                 })
+                .transpose()?;
+
+            let jitter = job
+                .jitter
+                .map(|j| parse_duration(&j)
+                    .map_err(|e| anyhow!("Invalid jitter '{}' in job '{}': {}", j, id, e)))
                 .transpose()?;
 
             Ok(Job {
@@ -129,6 +143,7 @@ pub fn parse_config(content: &str) -> Result<(RunnerConfig, Vec<Job>)> {
                 concurrency: job.concurrency,
                 retry,
                 working_dir: job.working_dir,
+                jitter,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -138,7 +153,9 @@ pub fn parse_config(content: &str) -> Result<(RunnerConfig, Vec<Job>)> {
 
 fn parse_duration(s: &str) -> Result<Duration> {
     let s = s.trim();
-    if let Some(secs) = s.strip_suffix('s') {
+    if let Some(millis) = s.strip_suffix("ms") {
+        Ok(Duration::from_millis(millis.parse()?))
+    } else if let Some(secs) = s.strip_suffix('s') {
         Ok(Duration::from_secs(secs.parse()?))
     } else if let Some(mins) = s.strip_suffix('m') {
         Ok(Duration::from_secs(mins.parse::<u64>()? * 60))
@@ -369,5 +386,62 @@ jobs:
     run: echo test
 "#;
         assert!(parse_config(yaml).is_err());
+    }
+
+    #[test]
+    fn parse_jitter() {
+        let yaml = r#"
+jobs:
+  with_jitter:
+    schedule:
+      cron: "* * * * *"
+    run: echo test
+    jitter: 30s
+  no_jitter:
+    schedule:
+      cron: "* * * * *"
+    run: echo test
+"#;
+        let (_, jobs) = parse_config(yaml).unwrap();
+        let find = |id: &str| jobs.iter().find(|j| j.id == id).unwrap();
+
+        assert_eq!(find("with_jitter").jitter, Some(Duration::from_secs(30)));
+        assert!(find("no_jitter").jitter.is_none());
+    }
+
+    #[test]
+    fn parse_retry_jitter() {
+        let yaml = r#"
+jobs:
+  with_retry_jitter:
+    schedule:
+      cron: "* * * * *"
+    run: echo test
+    retry:
+      max: 3
+      delay: 1s
+      jitter: 500ms
+  retry_no_jitter:
+    schedule:
+      cron: "* * * * *"
+    run: echo test
+    retry:
+      max: 2
+      delay: 1s
+"#;
+        let (_, jobs) = parse_config(yaml).unwrap();
+        let find = |id: &str| jobs.iter().find(|j| j.id == id).unwrap();
+
+        let retry1 = find("with_retry_jitter").retry.as_ref().unwrap();
+        assert_eq!(retry1.jitter, Some(Duration::from_millis(500)));
+
+        let retry2 = find("retry_no_jitter").retry.as_ref().unwrap();
+        assert!(retry2.jitter.is_none());
+    }
+
+    #[test]
+    fn parse_duration_milliseconds() {
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("1000ms").unwrap(), Duration::from_millis(1000));
     }
 }

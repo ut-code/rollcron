@@ -2,6 +2,7 @@ use crate::config::{Concurrency, Job, RetryConfig, RunnerConfig};
 use crate::git;
 use anyhow::Result;
 use chrono::{TimeZone, Utc};
+use rand::Rng;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -125,6 +126,16 @@ fn spawn_job(
 
 async fn execute_job(job: &Job, work_dir: &PathBuf) {
     let tag = format!("[job:{}]", job.id);
+
+    // Apply task jitter before first execution
+    if let Some(jitter_max) = job.jitter {
+        let jitter = generate_jitter(jitter_max);
+        if jitter > Duration::ZERO {
+            println!("{} Applying jitter: {:?}", tag, jitter);
+            sleep(jitter).await;
+        }
+    }
+
     let max_attempts = job.retry.as_ref().map(|r| r.max + 1).unwrap_or(1);
 
     for attempt in 0..max_attempts {
@@ -151,7 +162,24 @@ async fn execute_job(job: &Job, work_dir: &PathBuf) {
 }
 
 fn calculate_backoff(retry: &RetryConfig, attempt: u32) -> Duration {
-    retry.delay.saturating_mul(2u32.saturating_pow(attempt))
+    let base_delay = retry.delay.saturating_mul(2u32.saturating_pow(attempt));
+    let jitter_max = retry.jitter.unwrap_or_else(|| {
+        // Auto-infer jitter as 25% of retry delay when not explicitly set
+        retry.delay.saturating_mul(25) / 100
+    });
+    base_delay.saturating_add(generate_jitter(jitter_max))
+}
+
+fn generate_jitter(max: Duration) -> Duration {
+    if max.is_zero() {
+        return Duration::ZERO;
+    }
+    let millis = max.as_millis();
+    if millis == 0 {
+        return Duration::ZERO;
+    }
+    let jitter_millis = rand::thread_rng().gen_range(0..=millis);
+    Duration::from_millis(jitter_millis as u64)
 }
 
 async fn run_command(job: &Job, work_dir: &PathBuf) -> CommandResult {
@@ -246,6 +274,7 @@ mod tests {
             concurrency: Concurrency::Skip,
             retry: None,
             working_dir: None,
+            jitter: None,
         }
     }
 
@@ -268,11 +297,28 @@ mod tests {
         let retry = RetryConfig {
             max: 5,
             delay: Duration::from_secs(1),
+            jitter: None,
         };
-        assert_eq!(calculate_backoff(&retry, 0), Duration::from_secs(1));
-        assert_eq!(calculate_backoff(&retry, 1), Duration::from_secs(2));
-        assert_eq!(calculate_backoff(&retry, 2), Duration::from_secs(4));
-        assert_eq!(calculate_backoff(&retry, 3), Duration::from_secs(8));
+        // With auto-inferred jitter (25% of delay), backoff is base + random(0..25%)
+        // For attempt 0: base=1s, jitter=0-250ms -> 1000-1250ms
+        let backoff_0 = calculate_backoff(&retry, 0);
+        assert!(backoff_0 >= Duration::from_secs(1));
+        assert!(backoff_0 <= Duration::from_millis(1250));
+
+        // For attempt 1: base=2s, jitter=0-250ms -> 2000-2250ms
+        let backoff_1 = calculate_backoff(&retry, 1);
+        assert!(backoff_1 >= Duration::from_secs(2));
+        assert!(backoff_1 <= Duration::from_millis(2250));
+
+        // For attempt 2: base=4s, jitter=0-250ms -> 4000-4250ms
+        let backoff_2 = calculate_backoff(&retry, 2);
+        assert!(backoff_2 >= Duration::from_secs(4));
+        assert!(backoff_2 <= Duration::from_millis(4250));
+
+        // For attempt 3: base=8s, jitter=0-250ms -> 8000-8250ms
+        let backoff_3 = calculate_backoff(&retry, 3);
+        assert!(backoff_3 >= Duration::from_secs(8));
+        assert!(backoff_3 <= Duration::from_millis(8250));
     }
 
     #[tokio::test]
@@ -281,6 +327,7 @@ mod tests {
         job.retry = Some(RetryConfig {
             max: 2,
             delay: Duration::from_millis(10),
+            jitter: None,
         });
         let dir = tempdir().unwrap();
         let start = std::time::Instant::now();
@@ -295,11 +342,80 @@ mod tests {
         job.retry = Some(RetryConfig {
             max: 3,
             delay: Duration::from_millis(100),
+            jitter: None,
         });
         let dir = tempdir().unwrap();
         let start = std::time::Instant::now();
         execute_job(&job, &dir.path().to_path_buf()).await;
         // Should complete quickly without retries
         assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn generate_jitter_bounds() {
+        let max = Duration::from_millis(100);
+        for _ in 0..10 {
+            let jitter = generate_jitter(max);
+            assert!(jitter <= max);
+        }
+    }
+
+    #[test]
+    fn generate_jitter_zero() {
+        let jitter = generate_jitter(Duration::ZERO);
+        assert_eq!(jitter, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn job_with_task_jitter() {
+        let mut job = make_job("echo ok", 10);
+        job.jitter = Some(Duration::from_millis(50));
+        let dir = tempdir().unwrap();
+        let start = std::time::Instant::now();
+        execute_job(&job, &dir.path().to_path_buf()).await;
+        // Should have applied some jitter (at least started the delay)
+        // Can't assert exact timing due to randomness, but we verify it doesn't error
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn backoff_with_jitter() {
+        let retry = RetryConfig {
+            max: 3,
+            delay: Duration::from_secs(1),
+            jitter: Some(Duration::from_millis(500)),
+        };
+
+        for _ in 0..5 {
+            let backoff = calculate_backoff(&retry, 0);
+            // Base delay is 1s, jitter adds 0-500ms, so total should be 1000-1500ms
+            assert!(backoff >= Duration::from_secs(1));
+            assert!(backoff <= Duration::from_millis(1500));
+        }
+    }
+
+    #[test]
+    fn backoff_auto_inferred_jitter() {
+        let retry = RetryConfig {
+            max: 3,
+            delay: Duration::from_secs(10),
+            jitter: None, // No explicit jitter
+        };
+
+        for _ in 0..10 {
+            let backoff = calculate_backoff(&retry, 0);
+            // Auto-inferred jitter = 25% of delay = 2.5s
+            // Base delay is 10s, jitter adds 0-2500ms, so total should be 10000-12500ms
+            assert!(backoff >= Duration::from_secs(10));
+            assert!(backoff <= Duration::from_millis(12500));
+        }
+
+        // Test with different attempt numbers
+        for _ in 0..10 {
+            let backoff = calculate_backoff(&retry, 1);
+            // Base delay is 20s (10s * 2^1), jitter adds 0-2500ms, so total should be 20000-22500ms
+            assert!(backoff >= Duration::from_secs(20));
+            assert!(backoff <= Duration::from_millis(22500));
+        }
     }
 }
