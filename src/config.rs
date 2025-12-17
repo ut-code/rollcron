@@ -1,9 +1,20 @@
 use anyhow::{anyhow, Result};
+use chrono_tz::Tz;
 use cron::Schedule;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
+
+#[derive(Debug, Clone, Default)]
+pub struct RunnerConfig {
+    pub timezone: Option<Tz>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RunnerConfigRaw {
+    timezone: Option<String>,
+}
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -16,8 +27,10 @@ pub enum Concurrency {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Config {
-    pub jobs: HashMap<String, JobConfig>,
+struct Config {
+    #[serde(default)]
+    runner: RunnerConfigRaw,
+    jobs: HashMap<String, JobConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +43,7 @@ pub struct JobConfig {
     #[serde(default)]
     pub concurrency: Concurrency,
     pub retry: Option<RetryConfigRaw>,
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +76,7 @@ pub struct Job {
     pub timeout: Duration,
     pub concurrency: Concurrency,
     pub retry: Option<RetryConfig>,
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,11 +85,20 @@ pub struct RetryConfig {
     pub delay: Duration,
 }
 
-pub fn parse_config(content: &str) -> Result<Vec<Job>> {
+pub fn parse_config(content: &str) -> Result<(RunnerConfig, Vec<Job>)> {
     let config: Config = serde_yaml::from_str(content)
         .map_err(|e| anyhow!("Failed to parse YAML: {}", e))?;
 
-    config
+    let timezone = config
+        .runner
+        .timezone
+        .map(|s| s.parse::<Tz>())
+        .transpose()
+        .map_err(|e| anyhow!("Invalid timezone: {}", e))?;
+
+    let runner = RunnerConfig { timezone };
+
+    let jobs = config
         .jobs
         .into_iter()
         .map(|(id, job)| {
@@ -104,9 +128,12 @@ pub fn parse_config(content: &str) -> Result<Vec<Job>> {
                 timeout,
                 concurrency: job.concurrency,
                 retry,
+                working_dir: job.working_dir,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok((runner, jobs))
 }
 
 fn parse_duration(s: &str) -> Result<Duration> {
@@ -135,7 +162,7 @@ jobs:
       cron: "*/5 * * * *"
     run: echo hello
 "#;
-        let jobs = parse_config(yaml).unwrap();
+        let (_, jobs) = parse_config(yaml).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id, "hello");
         assert_eq!(jobs[0].name, "hello");
@@ -153,7 +180,7 @@ jobs:
       cron: "0 * * * *"
     run: cargo build
 "#;
-        let jobs = parse_config(yaml).unwrap();
+        let (_, jobs) = parse_config(yaml).unwrap();
         assert_eq!(jobs[0].id, "build");
         assert_eq!(jobs[0].name, "Build Project");
     }
@@ -168,7 +195,7 @@ jobs:
     run: sleep 30
     timeout: 60s
 "#;
-        let jobs = parse_config(yaml).unwrap();
+        let (_, jobs) = parse_config(yaml).unwrap();
         assert_eq!(jobs[0].timeout, Duration::from_secs(60));
     }
 
@@ -187,7 +214,7 @@ jobs:
     run: echo two
     timeout: 30s
 "#;
-        let jobs = parse_config(yaml).unwrap();
+        let (_, jobs) = parse_config(yaml).unwrap();
         assert_eq!(jobs.len(), 2);
     }
 
@@ -207,7 +234,7 @@ jobs:
       cron: "* * * * *"
     run: echo test
 "#;
-        let jobs = parse_config(yaml).unwrap();
+        let (_, jobs) = parse_config(yaml).unwrap();
         assert_eq!(jobs[0].concurrency, Concurrency::Skip);
     }
 
@@ -236,7 +263,7 @@ jobs:
     run: echo 4
     concurrency: replace
 "#;
-        let jobs = parse_config(yaml).unwrap();
+        let (_, jobs) = parse_config(yaml).unwrap();
         let find = |id: &str| jobs.iter().find(|j| j.id == id).unwrap();
 
         assert_eq!(find("parallel_job").concurrency, Concurrency::Parallel);
@@ -261,7 +288,7 @@ jobs:
       cron: "* * * * *"
     run: echo test
 "#;
-        let jobs = parse_config(yaml).unwrap();
+        let (_, jobs) = parse_config(yaml).unwrap();
         let find = |id: &str| jobs.iter().find(|j| j.id == id).unwrap();
 
         let retry = find("with_retry").retry.as_ref().unwrap();
@@ -282,9 +309,65 @@ jobs:
     retry:
       max: 2
 "#;
-        let jobs = parse_config(yaml).unwrap();
+        let (_, jobs) = parse_config(yaml).unwrap();
         let retry = jobs[0].retry.as_ref().unwrap();
         assert_eq!(retry.max, 2);
         assert_eq!(retry.delay, Duration::from_secs(1)); // default delay
+    }
+
+    #[test]
+    fn parse_runner_config() {
+        let yaml = r#"
+runner:
+  timezone: Asia/Tokyo
+jobs:
+  test:
+    schedule:
+      cron: "* * * * *"
+    run: echo test
+"#;
+        let (runner, _) = parse_config(yaml).unwrap();
+        assert_eq!(runner.timezone, Some(chrono_tz::Asia::Tokyo));
+    }
+
+    #[test]
+    fn parse_runner_config_defaults() {
+        let yaml = r#"
+jobs:
+  test:
+    schedule:
+      cron: "* * * * *"
+    run: echo test
+"#;
+        let (runner, _) = parse_config(yaml).unwrap();
+        assert!(runner.timezone.is_none());
+    }
+
+    #[test]
+    fn parse_working_dir() {
+        let yaml = r#"
+jobs:
+  test:
+    schedule:
+      cron: "* * * * *"
+    run: echo test
+    working_dir: ./scripts
+"#;
+        let (_, jobs) = parse_config(yaml).unwrap();
+        assert_eq!(jobs[0].working_dir.as_deref(), Some("./scripts"));
+    }
+
+    #[test]
+    fn parse_invalid_timezone() {
+        let yaml = r#"
+runner:
+  timezone: Invalid/Zone
+jobs:
+  test:
+    schedule:
+      cron: "* * * * *"
+    run: echo test
+"#;
+        assert!(parse_config(yaml).is_err());
     }
 }

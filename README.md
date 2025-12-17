@@ -61,7 +61,6 @@ rollcron https://github.com/user/repo --pull-interval 300
 
 ```yaml
 runner:                       # Optional: global settings
-  working_dir: ./scripts      # Working directory (relative to job dir)
   timezone: Asia/Tokyo        # Timezone for cron schedules (default: UTC)
 
 jobs:
@@ -72,6 +71,7 @@ jobs:
     run: command              # Shell command
     timeout: 10s              # Optional (default: 10s)
     concurrency: skip         # Optional: parallel|wait|skip|replace (default: skip)
+    working_dir: ./subdir     # Optional: working directory (relative to job snapshot dir)
     retry:                    # Optional
       max: 3                  # Max retry attempts
       delay: 1s               # Initial delay (default: 1s), exponential backoff
@@ -83,7 +83,6 @@ Global settings that apply to all jobs:
 
 | Field | Description |
 |-------|-------------|
-| `working_dir` | Working directory for all jobs (relative to job snapshot dir) |
 | `timezone` | Timezone for cron schedule interpretation (e.g., `Asia/Tokyo`, `America/New_York`) |
 
 ### Concurrency
@@ -161,14 +160,16 @@ Options:
 ## Example: GitHub Actions-style Workflow
 
 ```yaml
+runner:
+  timezone: America/New_York
+
 jobs:
   test:
     name: "Run Tests"
     schedule:
       cron: "0 */6 * * *"
-    run: |
-      npm install
-      npm test
+    run: npm test
+    working_dir: ./frontend
     retry:
       max: 2
       delay: 30s

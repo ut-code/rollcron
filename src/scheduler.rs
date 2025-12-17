@@ -1,7 +1,7 @@
-use crate::config::{Concurrency, Job, RetryConfig};
+use crate::config::{Concurrency, Job, RetryConfig, RunnerConfig};
 use crate::git;
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -11,24 +11,45 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
-pub async fn run_scheduler(jobs: Vec<Job>, sot_path: PathBuf) -> Result<()> {
+pub async fn run_scheduler(jobs: Vec<Job>, sot_path: PathBuf, runner: RunnerConfig) -> Result<()> {
     let running: Arc<Mutex<HashMap<String, Vec<JoinHandle<()>>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
     loop {
-        let now = Utc::now();
-
         for job in &jobs {
-            if let Some(next) = job.schedule.upcoming(Utc).next() {
-                let until_next = (next - now).num_milliseconds();
-                if until_next <= 1000 && until_next >= 0 {
-                    let work_dir = git::get_job_dir(&sot_path, &job.id);
-                    handle_job_trigger(job, work_dir, &running).await;
-                }
+            let is_due = match runner.timezone {
+                Some(tz) => is_job_due(&job.schedule, tz),
+                None => is_job_due(&job.schedule, Utc),
+            };
+
+            if is_due {
+                let work_dir = resolve_work_dir(&sot_path, &job.id, &job.working_dir);
+                handle_job_trigger(job, work_dir, &running).await;
             }
         }
 
         sleep(Duration::from_secs(1)).await;
+    }
+}
+
+fn is_job_due<Z: TimeZone>(schedule: &cron::Schedule, tz: Z) -> bool
+where
+    Z::Offset: std::fmt::Display,
+{
+    let now = Utc::now().with_timezone(&tz);
+    if let Some(next) = schedule.upcoming(tz).next() {
+        let until_next = (next - now).num_milliseconds();
+        until_next <= 1000 && until_next >= 0
+    } else {
+        false
+    }
+}
+
+fn resolve_work_dir(sot_path: &PathBuf, job_id: &str, working_dir: &Option<String>) -> PathBuf {
+    let job_dir = git::get_job_dir(sot_path, job_id);
+    match working_dir {
+        Some(dir) => job_dir.join(dir),
+        None => job_dir,
     }
 }
 
@@ -224,6 +245,7 @@ mod tests {
             timeout: Duration::from_secs(timeout_secs),
             concurrency: Concurrency::Skip,
             retry: None,
+            working_dir: None,
         }
     }
 

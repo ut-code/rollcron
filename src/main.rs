@@ -43,10 +43,10 @@ async fn main() -> Result<()> {
     let sot_path = git::ensure_repo(&source)?;
     println!("[rollcron] Cache: {}", sot_path.display());
 
-    let initial_jobs = load_config(&sot_path)?;
+    let (initial_runner, initial_jobs) = load_config(&sot_path)?;
     sync_job_dirs(&sot_path, &initial_jobs)?;
 
-    let (tx, mut rx) = tokio::sync::watch::channel(initial_jobs);
+    let (tx, mut rx) = tokio::sync::watch::channel((initial_runner, initial_jobs));
 
     // Spawn auto-sync task
     let source_clone = source.clone();
@@ -66,12 +66,12 @@ async fn main() -> Result<()> {
             println!("[rollcron] Synced from upstream");
 
             match load_config(&sot) {
-                Ok(jobs) => {
+                Ok((runner, jobs)) => {
                     if let Err(e) = sync_job_dirs(&sot, &jobs) {
                         eprintln!("[rollcron] Failed to sync job dirs: {}", e);
                         continue;
                     }
-                    let _ = tx.send(jobs);
+                    let _ = tx.send((runner, jobs));
                     println!("[rollcron] Synced job directories");
                 }
                 Err(e) => eprintln!("[rollcron] Failed to reload config: {}", e),
@@ -81,10 +81,10 @@ async fn main() -> Result<()> {
 
     // Main scheduler loop
     loop {
-        let jobs = rx.borrow_and_update().clone();
+        let (runner, jobs) = rx.borrow_and_update().clone();
         let sot = sot_path.clone();
         tokio::select! {
-            _ = scheduler::run_scheduler(jobs, sot) => {}
+            _ = scheduler::run_scheduler(jobs, sot, runner) => {}
             _ = rx.changed() => {
                 println!("[rollcron] Config updated, restarting scheduler");
             }
@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
     }
 }
 
-fn load_config(sot_path: &PathBuf) -> Result<Vec<config::Job>> {
+fn load_config(sot_path: &PathBuf) -> Result<(config::RunnerConfig, Vec<config::Job>)> {
     let config_path = sot_path.join(CONFIG_FILE);
     let content = std::fs::read_to_string(&config_path)
         .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", config_path.display(), e))?;
