@@ -1,7 +1,7 @@
-use crate::config::{Concurrency, Job, RetryConfig, RunnerConfig};
+use crate::config::{Concurrency, Job, RetryConfig, RunnerConfig, TimezoneConfig};
 use crate::git;
 use anyhow::Result;
-use chrono::{TimeZone, Utc};
+use chrono::{Local, TimeZone, Utc};
 use rand::Rng;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,9 +18,10 @@ pub async fn run_scheduler(jobs: Vec<Job>, sot_path: PathBuf, runner: RunnerConf
 
     loop {
         for job in &jobs {
-            let is_due = match runner.timezone {
-                Some(tz) => is_job_due(&job.schedule, tz),
-                None => is_job_due(&job.schedule, Utc),
+            let is_due = match &runner.timezone {
+                TimezoneConfig::Utc => is_job_due(&job.schedule, Utc),
+                TimezoneConfig::Inherit => is_job_due(&job.schedule, Local),
+                TimezoneConfig::Named(tz) => is_job_due(&job.schedule, *tz),
             };
 
             if is_due {

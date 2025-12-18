@@ -6,9 +6,17 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum TimezoneConfig {
+    #[default]
+    Utc,
+    Inherit,
+    Named(Tz),
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RunnerConfig {
-    pub timezone: Option<Tz>,
+    pub timezone: TimezoneConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -93,12 +101,14 @@ pub fn parse_config(content: &str) -> Result<(RunnerConfig, Vec<Job>)> {
     let config: Config = serde_yaml::from_str(content)
         .map_err(|e| anyhow!("Failed to parse YAML: {}", e))?;
 
-    let timezone = config
-        .runner
-        .timezone
-        .map(|s| s.parse::<Tz>())
-        .transpose()
-        .map_err(|e| anyhow!("Invalid timezone: {}", e))?;
+    let timezone = match config.runner.timezone {
+        None => TimezoneConfig::Utc,
+        Some(s) if s == "inherit" => TimezoneConfig::Inherit,
+        Some(s) => TimezoneConfig::Named(
+            s.parse::<Tz>()
+                .map_err(|e| anyhow!("Invalid timezone '{}': {}", s, e))?,
+        ),
+    };
 
     let runner = RunnerConfig { timezone };
 
@@ -344,7 +354,7 @@ jobs:
     run: echo test
 "#;
         let (runner, _) = parse_config(yaml).unwrap();
-        assert_eq!(runner.timezone, Some(chrono_tz::Asia::Tokyo));
+        assert_eq!(runner.timezone, TimezoneConfig::Named(chrono_tz::Asia::Tokyo));
     }
 
     #[test]
@@ -357,7 +367,22 @@ jobs:
     run: echo test
 "#;
         let (runner, _) = parse_config(yaml).unwrap();
-        assert!(runner.timezone.is_none());
+        assert_eq!(runner.timezone, TimezoneConfig::Utc);
+    }
+
+    #[test]
+    fn parse_timezone_inherit() {
+        let yaml = r#"
+runner:
+  timezone: inherit
+jobs:
+  test:
+    schedule:
+      cron: "* * * * *"
+    run: echo test
+"#;
+        let (runner, _) = parse_config(yaml).unwrap();
+        assert_eq!(runner.timezone, TimezoneConfig::Inherit);
     }
 
     #[test]

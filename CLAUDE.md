@@ -45,6 +45,9 @@ struct ScheduleConfig { cron: String }
 ## Config Format
 
 ```yaml
+runner:                        # Optional: global settings
+  timezone: Asia/Tokyo         # Optional: IANA name, "inherit" (system), or omit for UTC
+
 jobs:
   <job-id>:                  # Key = ID (used for directories)
     name: "Display Name"     # Optional (defaults to job-id)

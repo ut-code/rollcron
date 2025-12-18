@@ -70,6 +70,7 @@ rollcron https://github.com/ut-code/rollcron
 ```yaml
 runner:                       # Optional: global settings
   timezone: Asia/Tokyo        # Timezone for cron schedules (default: UTC)
+                              # Use "inherit" to use system timezone
 
 jobs:
   <job-id>:                   # Key is the job ID (used for directories)
@@ -93,7 +94,7 @@ Global settings that apply to all jobs:
 
 | Field | Description |
 |-------|-------------|
-| `timezone` | Timezone for cron schedule interpretation (e.g., `Asia/Tokyo`, `America/New_York`) |
+| `timezone` | Timezone for cron schedule interpretation. Use IANA names (e.g., `Asia/Tokyo`, `America/New_York`), `inherit` (system timezone), or omit for UTC |
 
 ### Concurrency
 
