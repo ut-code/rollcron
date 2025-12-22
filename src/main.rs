@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
     println!("[rollcron] Pull interval: {}s", args.pull_interval);
 
     // Initial sync
-    let sot_path = git::ensure_repo(&source)?;
+    let (sot_path, _) = git::ensure_repo(&source)?;
     println!("[rollcron] Cache: {}", sot_path.display());
 
     let (initial_runner, initial_jobs) = load_config(&sot_path)?;
@@ -72,14 +72,19 @@ async fn main() -> Result<()> {
         loop {
             ticker.tick().await;
 
-            let sot = match git::ensure_repo(&source_clone) {
-                Ok(p) => p,
+            let (sot, update_info) = match git::ensure_repo(&source_clone) {
+                Ok(r) => r,
                 Err(e) => {
                     eprintln!("[rollcron] Sync failed: {}", e);
                     continue;
                 }
             };
-            println!("[rollcron] Synced from upstream");
+
+            let Some(range) = update_info else {
+                continue;
+            };
+
+            println!("[rollcron] Pulled {}", range);
 
             match load_config(&sot) {
                 Ok((runner, jobs)) => {
@@ -90,7 +95,6 @@ async fn main() -> Result<()> {
                     }
                     drop(running);
                     let _ = tx.send((runner, jobs));
-                    println!("[rollcron] Synced job directories");
                 }
                 Err(e) => eprintln!("[rollcron] Failed to reload config: {}", e),
             }

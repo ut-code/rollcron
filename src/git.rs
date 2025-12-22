@@ -2,20 +2,21 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Ensures repo is cloned/synced to cache. Returns cache path.
-pub fn ensure_repo(source: &str) -> Result<PathBuf> {
+/// Ensures repo is cloned/synced to cache. Returns (cache path, commit_range if updated).
+pub fn ensure_repo(source: &str) -> Result<(PathBuf, Option<String>)> {
     let cache_dir = get_cache_dir(source)?;
     if let Some(parent) = cache_dir.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    if cache_dir.exists() {
-        sync_repo(&cache_dir)?;
+    let update_info = if cache_dir.exists() {
+        sync_repo(&cache_dir)?
     } else {
         clone_repo(source, &cache_dir)?;
-    }
+        Some("initial".to_string())
+    };
 
-    Ok(cache_dir)
+    Ok((cache_dir, update_info))
 }
 
 fn clone_repo(source: &str, dest: &Path) -> Result<()> {
@@ -34,7 +35,8 @@ fn clone_repo(source: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn sync_repo(dest: &Path) -> Result<()> {
+/// Returns commit range (e.g. "abc123..def456") if new commits were fetched
+fn sync_repo(dest: &Path) -> Result<Option<String>> {
     // git clone sets up tracking branches for both local and remote repos
     let has_upstream = Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "@{upstream}"])
@@ -53,9 +55,23 @@ fn sync_repo(dest: &Path) -> Result<()> {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("git pull failed: {}", stderr);
         }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.contains("Already up to date") {
+            return Ok(None);
+        }
+
+        // Extract commit range from "Updating abc123..def456"
+        let range = stdout
+            .lines()
+            .find(|l| l.starts_with("Updating "))
+            .and_then(|l| l.strip_prefix("Updating "))
+            .map(|s| s.to_string());
+
+        return Ok(range.or_else(|| Some("updated".to_string())));
     }
 
-    Ok(())
+    Ok(None)
 }
 
 fn get_cache_dir(source: &str) -> Result<PathBuf> {
