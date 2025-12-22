@@ -3,9 +3,13 @@ use std::time::Duration;
 
 use crate::config::RetryConfig;
 
+/// Default jitter ratio when not explicitly configured (25% of base delay)
+const AUTO_JITTER_RATIO: u32 = 25;
+
 pub fn calculate_backoff(retry: &RetryConfig, attempt: u32) -> Duration {
     let base_delay = retry.delay.saturating_mul(2u32.saturating_pow(attempt));
-    let jitter_max = retry.jitter.unwrap_or_else(|| retry.delay.saturating_mul(25) / 100);
+    let jitter_max =
+        retry.jitter.unwrap_or_else(|| retry.delay.saturating_mul(AUTO_JITTER_RATIO) / 100);
     base_delay.saturating_add(generate_jitter(jitter_max))
 }
 

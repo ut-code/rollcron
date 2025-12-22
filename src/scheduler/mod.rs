@@ -218,6 +218,9 @@ impl Scheduler {
 
 // === Helper Functions ===
 
+/// Tolerance for schedule matching (accounts for 1-second tick interval)
+const SCHEDULE_TOLERANCE_MS: i64 = 1000;
+
 fn is_job_due<Z: TimeZone>(schedule: &cron::Schedule, tz: Z) -> bool
 where
     Z::Offset: std::fmt::Display,
@@ -225,7 +228,7 @@ where
     let now = Utc::now().with_timezone(&tz);
     if let Some(next) = schedule.upcoming(tz).next() {
         let until_next = (next - now).num_milliseconds();
-        until_next <= 1000 && until_next >= 0
+        until_next <= SCHEDULE_TOLERANCE_MS && until_next >= 0
     } else {
         false
     }

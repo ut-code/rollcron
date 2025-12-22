@@ -81,6 +81,19 @@ enum CommandResult {
     Timeout,
 }
 
+fn print_output_lines(tag: &str, output: &str, use_stderr: bool) {
+    if output.trim().is_empty() {
+        return;
+    }
+    for line in output.lines() {
+        if use_stderr {
+            eprintln!("{}   | {}", tag, line);
+        } else {
+            println!("{}   | {}", tag, line);
+        }
+    }
+}
+
 fn handle_result(tag: &str, job: &Job, result: &CommandResult) -> bool {
     match result {
         CommandResult::Completed(output) => {
@@ -89,24 +102,12 @@ fn handle_result(tag: &str, job: &Job, result: &CommandResult) -> bool {
 
             if output.status.success() {
                 println!("{} ✓ Completed", tag);
-                if !stdout.trim().is_empty() {
-                    for line in stdout.lines() {
-                        println!("{}   | {}", tag, line);
-                    }
-                }
+                print_output_lines(tag, &stdout, false);
                 true
             } else {
                 eprintln!("{} ✗ Failed (exit code: {:?})", tag, output.status.code());
-                if !stderr.trim().is_empty() {
-                    for line in stderr.lines() {
-                        eprintln!("{}   | {}", tag, line);
-                    }
-                }
-                if !stdout.trim().is_empty() {
-                    for line in stdout.lines() {
-                        eprintln!("{}   | {}", tag, line);
-                    }
-                }
+                print_output_lines(tag, &stderr, true);
+                print_output_lines(tag, &stdout, true);
                 false
             }
         }
