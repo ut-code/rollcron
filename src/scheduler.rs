@@ -1,41 +1,241 @@
 use crate::config::{Concurrency, Job, RetryConfig, RunnerConfig, TimezoneConfig};
 use crate::git;
-use crate::{JobHandles, RunningJobs};
-use anyhow::Result;
 use chrono::{Local, TimeZone, Utc};
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
+use xtra::prelude::*;
+use xtra::refcount::Weak;
 
-pub async fn run_scheduler(
+/// Unified scheduler actor
+pub struct Scheduler {
+    // Config
     jobs: Vec<Job>,
     sot_path: PathBuf,
     runner: RunnerConfig,
-    running_jobs: RunningJobs,
-    job_handles: JobHandles,
-) -> Result<()> {
-    loop {
-        for job in &jobs {
-            let is_due = match &runner.timezone {
+
+    // Sync state
+    pending_syncs: HashSet<String>,
+
+    // Job state
+    running_jobs: HashMap<String, usize>,
+    job_handles: HashMap<String, Vec<JoinHandle<()>>>,
+}
+
+impl Scheduler {
+    pub fn new(jobs: Vec<Job>, sot_path: PathBuf, runner: RunnerConfig) -> Self {
+        Self {
+            jobs,
+            sot_path,
+            runner,
+            pending_syncs: HashSet::new(),
+            running_jobs: HashMap::new(),
+            job_handles: HashMap::new(),
+        }
+    }
+
+    fn try_sync_job(&mut self, job_id: &str) -> anyhow::Result<bool> {
+        if self.pending_syncs.remove(job_id) {
+            println!("[job:{}] Syncing directory", job_id);
+            let job_dir = git::get_job_dir(&self.sot_path, job_id);
+            git::sync_to_job_dir(&self.sot_path, &job_dir)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn cleanup_finished_handles(&mut self, job_id: &str) {
+        if let Some(handles) = self.job_handles.get_mut(job_id) {
+            handles.retain(|h| !h.is_finished());
+            if handles.is_empty() {
+                self.job_handles.remove(job_id);
+            }
+        }
+    }
+
+    fn running_count(&self, job_id: &str) -> usize {
+        self.job_handles.get(job_id).map(|v| v.len()).unwrap_or(0)
+    }
+}
+
+impl Actor for Scheduler {
+    type Stop = ();
+
+    async fn started(&mut self, mailbox: &Mailbox<Self>) -> Result<(), Self::Stop> {
+        // Spawn internal ticker
+        let addr = mailbox.address();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                if addr.send(Tick).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(())
+    }
+
+    async fn stopped(self) -> Self::Stop {}
+}
+
+// === Messages ===
+
+/// Internal tick to check cron schedules
+pub struct Tick;
+
+impl Handler<Tick> for Scheduler {
+    type Return = ();
+
+    async fn handle(&mut self, _msg: Tick, ctx: &mut Context<Self>) {
+        let addr = ctx.mailbox().address();
+
+        for job in &self.jobs.clone() {
+            let is_due = match &self.runner.timezone {
                 TimezoneConfig::Utc => is_job_due(&job.schedule, Utc),
                 TimezoneConfig::Inherit => is_job_due(&job.schedule, Local),
                 TimezoneConfig::Named(tz) => is_job_due(&job.schedule, *tz),
             };
 
             if is_due {
-                let work_dir = resolve_work_dir(&sot_path, &job.id, &job.working_dir);
-                handle_job_trigger(job, work_dir, &job_handles, &running_jobs).await;
+                // Try sync before running
+                if let Err(e) = self.try_sync_job(&job.id) {
+                    eprintln!("[job:{}] Sync failed: {}", job.id, e);
+                    continue;
+                }
+
+                self.handle_job_trigger(job, addr.clone()).await;
             }
         }
-
-        sleep(Duration::from_secs(1)).await;
     }
 }
+
+/// Mark jobs as needing sync (sent after git pull)
+pub struct SyncRequest {
+    pub job_ids: Vec<String>,
+    pub sot_path: PathBuf,
+}
+
+impl Handler<SyncRequest> for Scheduler {
+    type Return = ();
+
+    async fn handle(&mut self, msg: SyncRequest, _ctx: &mut Context<Self>) {
+        self.sot_path = msg.sot_path;
+        self.pending_syncs.extend(msg.job_ids);
+    }
+}
+
+/// Update config (sent after git pull with new config)
+pub struct ConfigUpdate {
+    pub jobs: Vec<Job>,
+    pub runner: RunnerConfig,
+}
+
+impl Handler<ConfigUpdate> for Scheduler {
+    type Return = ();
+
+    async fn handle(&mut self, msg: ConfigUpdate, _ctx: &mut Context<Self>) {
+        self.jobs = msg.jobs;
+        self.runner = msg.runner;
+        println!("[rollcron] Config updated");
+    }
+}
+
+/// Notification when a job completes
+pub struct JobCompleted {
+    pub job_id: String,
+}
+
+impl Handler<JobCompleted> for Scheduler {
+    type Return = ();
+
+    async fn handle(&mut self, msg: JobCompleted, _ctx: &mut Context<Self>) {
+        if let Some(count) = self.running_jobs.get_mut(&msg.job_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.running_jobs.remove(&msg.job_id);
+            }
+        }
+    }
+}
+
+// === Job Execution Logic ===
+
+impl Scheduler {
+    async fn handle_job_trigger(&mut self, job: &Job, addr: Address<Scheduler, Weak>) {
+        let tag = format!("[job:{}]", job.id);
+
+        self.cleanup_finished_handles(&job.id);
+        let running_count = self.running_count(&job.id);
+
+        match job.concurrency {
+            Concurrency::Parallel => {
+                self.spawn_job(job, addr);
+            }
+            Concurrency::Wait => {
+                if running_count > 0 {
+                    println!("{} Waiting for {} previous run(s) to complete", tag, running_count);
+                    if let Some(handles) = self.job_handles.remove(&job.id) {
+                        for handle in handles {
+                            let _ = handle.await;
+                        }
+                    }
+                    self.cleanup_finished_handles(&job.id);
+                }
+                self.spawn_job(job, addr);
+            }
+            Concurrency::Skip => {
+                if running_count > 0 {
+                    println!("{} Skipped ({} instance(s) still active)", tag, running_count);
+                } else {
+                    self.spawn_job(job, addr);
+                }
+            }
+            Concurrency::Replace => {
+                if running_count > 0 {
+                    println!("{} Replacing {} previous run(s)", tag, running_count);
+                    if let Some(handles) = self.job_handles.remove(&job.id) {
+                        let abort_count = handles.len();
+                        for handle in handles {
+                            handle.abort();
+                        }
+                        if let Some(count) = self.running_jobs.get_mut(&job.id) {
+                            *count = count.saturating_sub(abort_count);
+                            if *count == 0 {
+                                self.running_jobs.remove(&job.id);
+                            }
+                        }
+                    }
+                }
+                self.spawn_job(job, addr);
+            }
+        }
+    }
+
+    fn spawn_job(&mut self, job: &Job, addr: Address<Scheduler, Weak>) {
+        let job_id = job.id.clone();
+        let job = job.clone();
+        let work_dir = resolve_work_dir(&self.sot_path, &job.id, &job.working_dir);
+
+        // Increment running count
+        *self.running_jobs.entry(job_id.clone()).or_insert(0) += 1;
+
+        let handle = tokio::spawn(async move {
+            execute_job(&job, &work_dir).await;
+            // Notify completion
+            let _ = addr.send(JobCompleted { job_id: job.id }).await;
+        });
+
+        self.job_handles.entry(job_id).or_default().push(handle);
+    }
+}
+
+// === Helper Functions ===
 
 fn is_job_due<Z: TimeZone>(schedule: &cron::Schedule, tz: Z) -> bool
 where
@@ -56,120 +256,6 @@ fn resolve_work_dir(sot_path: &PathBuf, job_id: &str, working_dir: &Option<Strin
         Some(dir) => job_dir.join(dir),
         None => job_dir,
     }
-}
-
-async fn handle_job_trigger(
-    job: &Job,
-    work_dir: PathBuf,
-    job_handles: &JobHandles,
-    running_jobs: &RunningJobs,
-) {
-    let tag = format!("[job:{}]", job.id);
-    let mut map = job_handles.lock().await;
-
-    // Clean up finished jobs
-    if let Some(handles) = map.get_mut(&job.id) {
-        handles.retain(|h| !h.is_finished());
-        if handles.is_empty() {
-            map.remove(&job.id);
-        }
-    }
-
-    let running_count = map.get(&job.id).map(|v| v.len()).unwrap_or(0);
-
-    match job.concurrency {
-        Concurrency::Parallel => {
-            spawn_job(job, work_dir, &mut map, running_jobs).await;
-        }
-        Concurrency::Wait => {
-            if running_count > 0 {
-                println!(
-                    "{} Waiting for {} previous run(s) to complete",
-                    tag, running_count
-                );
-                let handles = map.remove(&job.id).unwrap();
-                drop(map); // Release lock while waiting
-                for handle in handles {
-                    let _ = handle.await;
-                }
-                // Re-acquire lock and spawn
-                // Note: Since we have a single scheduler loop, no new instances
-                // can be added while we're waiting, so we can safely spawn.
-                let mut map = job_handles.lock().await;
-                // Defensive check: clean up any handles that completed during wait
-                if let Some(handles) = map.get_mut(&job.id) {
-                    handles.retain(|h| !h.is_finished());
-                    if handles.is_empty() {
-                        map.remove(&job.id);
-                    }
-                }
-                spawn_job(job, work_dir, &mut map, running_jobs).await;
-            } else {
-                spawn_job(job, work_dir, &mut map, running_jobs).await;
-            }
-        }
-        Concurrency::Skip => {
-            if running_count > 0 {
-                println!("{} Skipped ({} instance(s) still active)", tag, running_count);
-            } else {
-                spawn_job(job, work_dir, &mut map, running_jobs).await;
-            }
-        }
-        Concurrency::Replace => {
-            if running_count > 0 {
-                println!("{} Replacing {} previous run(s)", tag, running_count);
-                let handles = map.remove(&job.id).unwrap();
-                let abort_count = handles.len();
-                for handle in handles {
-                    handle.abort();
-                }
-                // Decrement running count for aborted jobs
-                {
-                    let mut rj = running_jobs.write().await;
-                    if let Some(count) = rj.get_mut(&job.id) {
-                        *count = count.saturating_sub(abort_count);
-                        if *count == 0 {
-                            rj.remove(&job.id);
-                        }
-                    }
-                }
-            }
-            spawn_job(job, work_dir, &mut map, running_jobs).await;
-        }
-    }
-}
-
-async fn spawn_job(
-    job: &Job,
-    work_dir: PathBuf,
-    map: &mut HashMap<String, Vec<JoinHandle<()>>>,
-    running_jobs: &RunningJobs,
-) {
-    let job_id = job.id.clone();
-    let job = job.clone();
-    let running_jobs = Arc::clone(running_jobs);
-
-    // Increment running count before spawning
-    {
-        let mut rj = running_jobs.write().await;
-        *rj.entry(job_id.clone()).or_insert(0) += 1;
-    }
-
-    let handle = tokio::spawn(async move {
-        execute_job(&job, &work_dir).await;
-        // Decrement running count when done
-        {
-            let mut rj = running_jobs.write().await;
-            if let Some(count) = rj.get_mut(&job.id) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    rj.remove(&job.id);
-                }
-            }
-        }
-    });
-
-    map.entry(job_id).or_default().push(handle);
 }
 
 async fn execute_job(job: &Job, work_dir: &PathBuf) {
@@ -212,7 +298,6 @@ async fn execute_job(job: &Job, work_dir: &PathBuf) {
 fn calculate_backoff(retry: &RetryConfig, attempt: u32) -> Duration {
     let base_delay = retry.delay.saturating_mul(2u32.saturating_pow(attempt));
     let jitter_max = retry.jitter.unwrap_or_else(|| {
-        // Auto-infer jitter as 25% of retry delay when not explicitly set
         retry.delay.saturating_mul(25) / 100
     });
     base_delay.saturating_add(generate_jitter(jitter_max))
@@ -248,10 +333,7 @@ async fn run_command(job: &Job, work_dir: &PathBuf) -> CommandResult {
     match result {
         Ok(Ok(output)) => CommandResult::Completed(output),
         Ok(Err(e)) => CommandResult::ExecError(e.to_string()),
-        Err(_) => {
-            // Timeout: child is killed automatically by kill_on_drop(true)
-            CommandResult::Timeout
-        }
+        Err(_) => CommandResult::Timeout,
     }
 }
 
@@ -343,23 +425,18 @@ mod tests {
             delay: Duration::from_secs(1),
             jitter: None,
         };
-        // With auto-inferred jitter (25% of delay), backoff is base + random(0..25%)
-        // For attempt 0: base=1s, jitter=0-250ms -> 1000-1250ms
         let backoff_0 = calculate_backoff(&retry, 0);
         assert!(backoff_0 >= Duration::from_secs(1));
         assert!(backoff_0 <= Duration::from_millis(1250));
 
-        // For attempt 1: base=2s, jitter=0-250ms -> 2000-2250ms
         let backoff_1 = calculate_backoff(&retry, 1);
         assert!(backoff_1 >= Duration::from_secs(2));
         assert!(backoff_1 <= Duration::from_millis(2250));
 
-        // For attempt 2: base=4s, jitter=0-250ms -> 4000-4250ms
         let backoff_2 = calculate_backoff(&retry, 2);
         assert!(backoff_2 >= Duration::from_secs(4));
         assert!(backoff_2 <= Duration::from_millis(4250));
 
-        // For attempt 3: base=8s, jitter=0-250ms -> 8000-8250ms
         let backoff_3 = calculate_backoff(&retry, 3);
         assert!(backoff_3 >= Duration::from_secs(8));
         assert!(backoff_3 <= Duration::from_millis(8250));
@@ -376,7 +453,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let start = std::time::Instant::now();
         execute_job(&job, &dir.path().to_path_buf()).await;
-        // Should have waited at least 10ms + 20ms = 30ms for 2 retries
         assert!(start.elapsed() >= Duration::from_millis(30));
     }
 
@@ -391,7 +467,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let start = std::time::Instant::now();
         execute_job(&job, &dir.path().to_path_buf()).await;
-        // Should complete quickly without retries
         assert!(start.elapsed() < Duration::from_millis(100));
     }
 
@@ -417,8 +492,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let start = std::time::Instant::now();
         execute_job(&job, &dir.path().to_path_buf()).await;
-        // Should have applied some jitter (at least started the delay)
-        // Can't assert exact timing due to randomness, but we verify it doesn't error
         assert!(start.elapsed() < Duration::from_secs(1));
     }
 
@@ -432,7 +505,6 @@ mod tests {
 
         for _ in 0..5 {
             let backoff = calculate_backoff(&retry, 0);
-            // Base delay is 1s, jitter adds 0-500ms, so total should be 1000-1500ms
             assert!(backoff >= Duration::from_secs(1));
             assert!(backoff <= Duration::from_millis(1500));
         }
@@ -443,21 +515,17 @@ mod tests {
         let retry = RetryConfig {
             max: 3,
             delay: Duration::from_secs(10),
-            jitter: None, // No explicit jitter
+            jitter: None,
         };
 
         for _ in 0..10 {
             let backoff = calculate_backoff(&retry, 0);
-            // Auto-inferred jitter = 25% of delay = 2.5s
-            // Base delay is 10s, jitter adds 0-2500ms, so total should be 10000-12500ms
             assert!(backoff >= Duration::from_secs(10));
             assert!(backoff <= Duration::from_millis(12500));
         }
 
-        // Test with different attempt numbers
         for _ in 0..10 {
             let backoff = calculate_backoff(&retry, 1);
-            // Base delay is 20s (10s * 2^1), jitter adds 0-2500ms, so total should be 20000-22500ms
             assert!(backoff >= Duration::from_secs(20));
             assert!(backoff <= Duration::from_millis(22500));
         }

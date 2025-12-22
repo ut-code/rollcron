@@ -14,6 +14,7 @@ dirs = "6"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 rand = "0.8"
+xtra = { version = "0.6", features = ["tokio"] }
 
 [dev-dependencies]
 tempfile = "3"
