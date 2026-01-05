@@ -1,3 +1,4 @@
+use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -9,6 +10,33 @@ use crate::env;
 use crate::git;
 
 use super::backoff::{calculate_backoff, generate_jitter};
+
+/// Webhook notification payload
+#[derive(Debug, Serialize)]
+pub struct WebhookPayload {
+    pub text: String,
+    pub job_id: String,
+    pub job_name: String,
+    pub error: String,
+    pub stderr: String,
+    pub attempts: u32,
+}
+
+/// Send webhook notification for job failure
+async fn send_webhook(url: &str, payload: &WebhookPayload) {
+    let client = reqwest::Client::new();
+    match client.post(url).json(payload).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            println!("[webhook] Notification sent to {}", url);
+        }
+        Ok(resp) => {
+            eprintln!("[webhook] Failed to send notification: HTTP {}", resp.status());
+        }
+        Err(e) => {
+            eprintln!("[webhook] Failed to send notification: {}", e);
+        }
+    }
+}
 
 pub fn resolve_work_dir(sot_path: &PathBuf, job_id: &str, working_dir: &Option<String>) -> PathBuf {
     let job_dir = git::get_job_dir(sot_path, job_id);
@@ -45,6 +73,7 @@ pub async fn execute_job(job: &Job, work_dir: &PathBuf, sot_path: &PathBuf, runn
     }
 
     let max_attempts = job.retry.as_ref().map(|r| r.max + 1).unwrap_or(1);
+    let mut last_result: Option<CommandResult> = None;
 
     for attempt in 0..max_attempts {
         if attempt > 0 {
@@ -65,9 +94,36 @@ pub async fn execute_job(job: &Job, work_dir: &PathBuf, sot_path: &PathBuf, runn
             return;
         }
 
+        last_result = Some(result);
+
         if attempt + 1 < max_attempts {
             println!("{} Will retry...", tag);
         }
+    }
+
+    // All retries exhausted - send webhook notification if configured
+    if let Some(webhook_url) = &job.webhook {
+        let (error, stderr) = match &last_result {
+            Some(CommandResult::Completed(output)) => {
+                let err = format!("exit code {:?}", output.status.code());
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                (err, stderr)
+            }
+            Some(CommandResult::ExecError(e)) => (format!("exec error: {}", e), String::new()),
+            Some(CommandResult::Timeout) => (format!("timeout after {:?}", job.timeout), String::new()),
+            None => ("unknown error".to_string(), String::new()),
+        };
+
+        let payload = WebhookPayload {
+            text: format!("[rollcron] Job '{}' failed", job.name),
+            job_id: job.id.clone(),
+            job_name: job.name.clone(),
+            error,
+            stderr,
+            attempts: max_attempts,
+        };
+
+        send_webhook(webhook_url, &payload).await;
     }
 }
 
@@ -218,6 +274,7 @@ mod tests {
             timezone: None,
             env_file: None,
             env: None,
+            webhook: None,
         }
     }
 
@@ -226,6 +283,7 @@ mod tests {
             timezone: TimezoneConfig::Utc,
             env_file: None,
             env: None,
+            webhook: None,
         }
     }
 
@@ -392,5 +450,22 @@ mod tests {
         assert_eq!(result.get("VAR3"), Some(&"from_job_file".to_string()));
         // VAR4: in all layers (job.env wins)
         assert_eq!(result.get("VAR4"), Some(&"from_job_env".to_string()));
+    }
+
+    #[test]
+    fn test_webhook_payload_serialization() {
+        let payload = WebhookPayload {
+            text: "[rollcron] Job 'test' failed".to_string(),
+            job_id: "test".to_string(),
+            job_name: "Test Job".to_string(),
+            error: "exit code 1".to_string(),
+            stderr: "Error output".to_string(),
+            attempts: 3,
+        };
+
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"text\":\"[rollcron] Job 'test' failed\""));
+        assert!(json.contains("\"job_id\":\"test\""));
+        assert!(json.contains("\"attempts\":3"));
     }
 }

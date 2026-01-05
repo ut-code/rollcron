@@ -35,6 +35,7 @@ pub struct RunnerConfig {
     pub timezone: TimezoneConfig,
     pub env_file: Option<String>,
     pub env: Option<HashMap<String, String>>,
+    pub webhook: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -42,6 +43,7 @@ struct RunnerConfigRaw {
     timezone: Option<String>,
     env_file: Option<String>,
     env: Option<HashMap<String, String>>,
+    webhook: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -76,6 +78,7 @@ pub struct JobConfig {
     pub enabled: Option<bool>,
     pub env_file: Option<String>,
     pub env: Option<HashMap<String, String>>,
+    pub webhook: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,6 +119,7 @@ pub struct Job {
     pub timezone: Option<TimezoneConfig>,
     pub env_file: Option<String>,
     pub env: Option<HashMap<String, String>>,
+    pub webhook: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -163,10 +167,14 @@ pub fn parse_config(content: &str) -> Result<(RunnerConfig, Vec<Job>)> {
         ),
     };
 
+    // Extract runner webhook for use in job defaults
+    let runner_webhook = config.runner.webhook;
+
     let runner = RunnerConfig {
         timezone: timezone.clone(),
         env_file: config.runner.env_file,
         env: config.runner.env,
+        webhook: runner_webhook.clone(),
     };
 
     let jobs = config
@@ -227,6 +235,9 @@ pub fn parse_config(content: &str) -> Result<(RunnerConfig, Vec<Job>)> {
                 .transpose()?
                 .or(Some(timezone.clone()));
 
+            // Job webhook overrides runner webhook
+            let webhook = job.webhook.or_else(|| runner_webhook.clone());
+
             Ok(Job {
                 id,
                 name,
@@ -241,6 +252,7 @@ pub fn parse_config(content: &str) -> Result<(RunnerConfig, Vec<Job>)> {
                 timezone: job_timezone,
                 env_file: job.env_file,
                 env: job.env,
+                webhook,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -813,5 +825,53 @@ jobs:
             jobs[0].env.as_ref().unwrap().get("LOCAL_VAR"),
             Some(&"local_value".to_string())
         );
+    }
+
+    #[test]
+    fn parse_runner_webhook() {
+        let yaml = r#"
+runner:
+  webhook: https://hooks.slack.com/test
+jobs:
+  test:
+    schedule:
+      cron: "* * * * *"
+    run: echo test
+"#;
+        let (runner, jobs) = parse_config(yaml).unwrap();
+        assert_eq!(runner.webhook.as_deref(), Some("https://hooks.slack.com/test"));
+        // Job inherits runner webhook
+        assert_eq!(jobs[0].webhook.as_deref(), Some("https://hooks.slack.com/test"));
+    }
+
+    #[test]
+    fn parse_job_webhook_override() {
+        let yaml = r#"
+runner:
+  webhook: https://hooks.slack.com/default
+jobs:
+  test:
+    schedule:
+      cron: "* * * * *"
+    run: echo test
+    webhook: https://discord.com/api/webhooks/custom
+"#;
+        let (_, jobs) = parse_config(yaml).unwrap();
+        // Job webhook overrides runner webhook
+        assert_eq!(jobs[0].webhook.as_deref(), Some("https://discord.com/api/webhooks/custom"));
+    }
+
+    #[test]
+    fn parse_no_webhook() {
+        let yaml = r#"
+jobs:
+  test:
+    schedule:
+      cron: "* * * * *"
+    run: echo test
+"#;
+        let (runner, jobs) = parse_config(yaml).unwrap();
+        assert!(runner.webhook.is_none());
+        assert!(jobs[0].webhook.is_none());
     }
 }

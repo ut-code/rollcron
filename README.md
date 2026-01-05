@@ -88,6 +88,7 @@ jobs:
     env_file: .env.local      # Optional: .env file (relative to job snapshot dir)
     env:                      # Optional: inline environment variables
       KEY: value
+    webhook: https://...      # Optional: webhook URL for failure notifications
     retry:                    # Optional
       max: 3                  # Max retry attempts
       delay: 1s               # Initial delay (default: 1s), exponential backoff
@@ -103,6 +104,32 @@ Global settings that apply to all jobs:
 | `timezone` | Timezone for cron schedule interpretation. Use IANA names (e.g., `Asia/Tokyo`, `America/New_York`), `inherit` (system timezone), or omit for UTC |
 | `env_file` | Path to .env file (relative to repo root) |
 | `env` | Inline key-value environment variables |
+| `webhook` | Webhook URL for failure notifications (default for all jobs) |
+
+### Webhooks
+
+Send notifications when jobs fail (after all retries exhausted):
+
+```yaml
+runner:
+  webhook: https://hooks.slack.com/services/...  # Default for all jobs
+
+jobs:
+  critical-job:
+    webhook: https://discord.com/api/webhooks/...  # Override for this job
+```
+
+Payload format (JSON POST):
+```json
+{
+  "text": "[rollcron] Job 'job-name' failed",
+  "job_id": "my-job",
+  "job_name": "My Job",
+  "error": "exit code 1",
+  "stderr": "Error output...",
+  "attempts": 3
+}
+```
 
 ### Environment Variables
 
