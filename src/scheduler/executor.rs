@@ -340,7 +340,7 @@ fn handle_result(job: &Job, result: &CommandResult, log_file: Option<&mut File>)
 mod tests {
     use super::*;
     use crate::config::{Concurrency, RetryConfig, TimezoneConfig};
-    use cron::Schedule;
+    use croner::Cron;
     use std::str::FromStr;
     use tempfile::tempdir;
 
@@ -348,7 +348,7 @@ mod tests {
         Job {
             id: "test".to_string(),
             name: "Test Job".to_string(),
-            schedule: Schedule::from_str("* * * * * *").unwrap(),
+            schedule: Cron::from_str("* * * * *").unwrap(),
             command: cmd.to_string(),
             timeout: Duration::from_secs(timeout_secs),
             concurrency: Concurrency::Skip,

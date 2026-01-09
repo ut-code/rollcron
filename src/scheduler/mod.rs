@@ -4,6 +4,7 @@ mod executor;
 use crate::config::{Concurrency, Job, RunnerConfig, TimezoneConfig};
 use crate::git;
 use chrono::{Local, TimeZone, Utc};
+use croner::Cron;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -291,12 +292,12 @@ impl Scheduler {
 /// Tolerance for schedule matching (accounts for 1-second tick interval)
 const SCHEDULE_TOLERANCE_MS: i64 = 1000;
 
-fn is_job_due<Z: TimeZone>(schedule: &cron::Schedule, tz: Z) -> bool
+fn is_job_due<Z: TimeZone>(schedule: &Cron, tz: Z) -> bool
 where
     Z::Offset: std::fmt::Display,
 {
     let now = Utc::now().with_timezone(&tz);
-    if let Some(next) = schedule.upcoming(tz).next() {
+    if let Some(next) = schedule.find_next_occurrence(&now, false).ok() {
         let until_next = (next.clone() - now.clone()).num_milliseconds();
         let is_due = until_next <= SCHEDULE_TOLERANCE_MS && until_next >= -SCHEDULE_TOLERANCE_MS;
         if is_due {
@@ -319,13 +320,12 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use chrono_tz::Asia::Tokyo;
-    use cron::Schedule;
     use std::str::FromStr;
 
     #[test]
     fn debug_timezone_schedule() {
-        // "0 8 * * *" -> "0 0 8 * * *" (8:00 AM)
-        let schedule = Schedule::from_str("0 0 8 * * *").unwrap();
+        // "0 8 * * *" (8:00 AM) - standard 5-field cron
+        let schedule = Cron::from_str("0 8 * * *").unwrap();
 
         let now_utc = Utc::now();
         let now_tokyo = now_utc.with_timezone(&Tokyo);
@@ -334,11 +334,11 @@ mod tests {
         println!("Current Tokyo: {}", now_tokyo);
 
         // Get next scheduled time in Tokyo timezone
-        let next_tokyo = schedule.upcoming(Tokyo).next().unwrap();
+        let next_tokyo = schedule.find_next_occurrence(&now_tokyo, false).unwrap();
         println!("Next scheduled (Tokyo): {}", next_tokyo);
 
         // Get next scheduled time in UTC
-        let next_utc = schedule.upcoming(Utc).next().unwrap();
+        let next_utc = schedule.find_next_occurrence(&now_utc, false).unwrap();
         println!("Next scheduled (UTC): {}", next_utc);
 
         // The difference should reflect timezone
@@ -348,7 +348,7 @@ mod tests {
     #[test]
     fn debug_is_job_due_at_specific_time() {
         // Simulate: it's 8:00 AM Tokyo, job should be due
-        let schedule = Schedule::from_str("0 0 8 * * *").unwrap();
+        let schedule = Cron::from_str("0 8 * * *").unwrap();
 
         // 8:00 AM Tokyo = 23:00 UTC (previous day)
         let fake_now_utc = chrono::Utc.with_ymd_and_hms(2026, 1, 9, 23, 0, 0).unwrap();
@@ -356,8 +356,8 @@ mod tests {
         println!("Fake now UTC: {}", fake_now_utc);
         println!("Fake now Tokyo: {}", fake_now_tokyo);
 
-        // What does upcoming return at this time?
-        let next = schedule.upcoming(Tokyo).next().unwrap();
+        // What does find_next_occurrence return at this time?
+        let next = schedule.find_next_occurrence(&fake_now_tokyo, false).unwrap();
         println!("Next scheduled: {}", next);
 
         // Check: is 8:00 AM Tokyo the next time?
@@ -370,7 +370,7 @@ mod tests {
     fn debug_what_triggers_at_2108() {
         // User reports job triggers at 21:08 JST (9:08 PM)
         // Let's see what schedule would match at this time
-        let schedule = Schedule::from_str("0 0 8 * * *").unwrap();
+        let schedule = Cron::from_str("0 8 * * *").unwrap();
 
         // 21:08 JST = 12:08 UTC
         println!("=== Testing at 21:08 JST ===");
@@ -378,16 +378,20 @@ mod tests {
         println!("Time in JST: {}", time_2108_jst);
         println!("Time in UTC: {}", time_2108_jst.with_timezone(&Utc));
 
-        let next_tokyo = schedule.upcoming(Tokyo).next().unwrap();
-        let next_utc = schedule.upcoming(Utc).next().unwrap();
+        let next_tokyo = schedule.find_next_occurrence(&time_2108_jst, false).unwrap();
+        let next_utc = schedule
+            .find_next_occurrence(&time_2108_jst.with_timezone(&Utc), false)
+            .unwrap();
         println!("Next (Tokyo tz): {}", next_tokyo);
         println!("Next (UTC tz): {}", next_utc);
 
         // Check if 21:08 would match any interpretation
         println!("\n=== What cron would trigger at 21:08? ===");
         // "8 21 * * *" = 21:08
-        let schedule_2108 = Schedule::from_str("0 8 21 * * *").unwrap();
-        let next_2108 = schedule_2108.upcoming(Tokyo).next().unwrap();
-        println!("Schedule '0 8 21 * * *' next: {}", next_2108);
+        let schedule_2108 = Cron::from_str("8 21 * * *").unwrap();
+        let next_2108 = schedule_2108
+            .find_next_occurrence(&time_2108_jst, false)
+            .unwrap();
+        println!("Schedule '8 21 * * *' next: {}", next_2108);
     }
 }
