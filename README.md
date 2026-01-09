@@ -10,20 +10,14 @@ Self-updating cron scheduler that pulls job definitions from git.
 cargo install --path .
 ```
 
-### Nix
+### mise
+
+This project uses [mise](https://mise.jdx.dev/) for tool version management. After installing mise:
 
 ```bash
-# Run directly
-nix run github:ut-code/rollcron -- /path/to/repo
-
-# Install
-nix profile install github:ut-code/rollcron
-
-# Open a shell
-nix shell github:ut-code/rollcron
+mise install
+cargo install --path .
 ```
-
-I recommend installing this via https://github.com/aster-void/nix-repository for build cache.
 
 ## Quick Start
 
