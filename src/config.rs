@@ -63,7 +63,6 @@ pub struct RunnerConfig {
     pub timezone: TimezoneConfig,
     pub env_file: Option<String>,
     pub env: Option<HashMap<String, String>>,
-    pub webhook: Vec<WebhookConfig>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -254,7 +253,6 @@ pub fn parse_config(content: &str) -> Result<(RunnerConfig, Vec<Job>)> {
         timezone: timezone.clone(),
         env_file: config.runner.env_file,
         env: config.runner.env,
-        webhook: runner_webhook.clone(),
     };
 
     let jobs = config
@@ -938,9 +936,7 @@ jobs:
       cron: "* * * * *"
     run: echo test
 "#;
-        let (runner, jobs) = parse_config(yaml).unwrap();
-        assert_eq!(runner.webhook.len(), 1);
-        assert_eq!(runner.webhook[0].to_url(), "https://hooks.slack.com/test");
+        let (_, jobs) = parse_config(yaml).unwrap();
         // Job inherits runner webhook
         assert_eq!(jobs[0].webhook.len(), 1);
         assert_eq!(jobs[0].webhook[0].to_url(), "https://hooks.slack.com/test");
@@ -974,8 +970,7 @@ jobs:
       cron: "* * * * *"
     run: echo test
 "#;
-        let (runner, jobs) = parse_config(yaml).unwrap();
-        assert!(runner.webhook.is_empty());
+        let (_, jobs) = parse_config(yaml).unwrap();
         assert!(jobs[0].webhook.is_empty());
     }
 

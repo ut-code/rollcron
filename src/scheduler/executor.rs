@@ -370,7 +370,6 @@ mod tests {
             timezone: TimezoneConfig::Utc,
             env_file: None,
             env: None,
-            webhook: vec![],
         }
     }
 

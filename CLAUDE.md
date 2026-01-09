@@ -44,7 +44,6 @@ struct RunnerConfig {
     timezone: TimezoneConfig,
     env_file: Option<String>,  // Path to .env file (relative to repo root)
     env: Option<HashMap<String, String>>,  // Inline env vars
-    webhook: Vec<WebhookConfig>,
 }
 
 // Parsed from rollcron.yaml
