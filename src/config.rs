@@ -5,6 +5,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
+use tracing::warn;
 
 fn validate_job_id(id: &str) -> Result<()> {
     if id.is_empty() {
@@ -234,8 +235,8 @@ fn normalize_dow_value(val: &str) -> String {
 }
 
 pub fn parse_config(content: &str) -> Result<(RunnerConfig, Vec<Job>)> {
-    let config: Config = serde_yaml::from_str(content)
-        .map_err(|e| anyhow!("Failed to parse YAML: {}", e))?;
+    let config: Config =
+        serde_yaml::from_str(content).map_err(|e| anyhow!("Failed to parse YAML: {}", e))?;
 
     let timezone = match config.runner.timezone {
         None => TimezoneConfig::Utc,
@@ -258,90 +259,117 @@ pub fn parse_config(content: &str) -> Result<(RunnerConfig, Vec<Job>)> {
     let jobs = config
         .jobs
         .into_iter()
-        .map(|(id, job)| {
-            validate_job_id(&id)?;
-
-            // Convert 5-field cron to 6-field by prepending seconds (0)
-            // Also normalize day-of-week: 0 → 7 (cron crate uses 1-7, not 0-6)
-            let normalized_cron = normalize_cron(&job.schedule.cron);
-            let schedule_str = format!("0 {}", normalized_cron);
-            let schedule = Schedule::from_str(&schedule_str)
-                .map_err(|e| anyhow!("Invalid cron '{}' in job '{}': {}", job.schedule.cron, id, e))?;
-
-            let timeout = parse_duration(&job.timeout)
-                .map_err(|e| anyhow!("Invalid timeout '{}' in job '{}': {}", job.timeout, id, e))?;
-
-            let name = job.name.unwrap_or_else(|| id.clone());
-
-            let retry = job
-                .retry
-                .map(|r| {
-                    if r.max == 0 {
-                        anyhow::bail!(
-                            "Invalid retry.max '0' in job '{}': must be at least 1 (use no retry config to disable retries)",
-                            id
-                        );
-                    }
-                    let delay = parse_duration(&r.delay)
-                        .map_err(|e| anyhow!("Invalid retry delay '{}' in job '{}': {}", r.delay, id, e))?;
-                    let jitter = r.jitter
-                        .map(|j| parse_duration(&j)
-                            .map_err(|e| anyhow!("Invalid retry jitter '{}' in job '{}': {}", j, id, e)))
-                        .transpose()?;
-                    Ok::<_, anyhow::Error>(RetryConfig { max: r.max, delay, jitter })
-                })
-                .transpose()?;
-
-            let jitter = job
-                .jitter
-                .map(|j| parse_duration(&j)
-                    .map_err(|e| anyhow!("Invalid jitter '{}' in job '{}': {}", j, id, e)))
-                .transpose()?;
-
-            let job_timezone = job
-                .schedule
-                .timezone
-                .map(|tz| {
-                    if tz == "inherit" {
-                        Ok(TimezoneConfig::Inherit)
-                    } else {
-                        tz.parse::<Tz>()
-                            .map(TimezoneConfig::Named)
-                            .map_err(|e| anyhow!("Invalid timezone '{}' in job '{}': {}", tz, id, e))
-                    }
-                })
-                .transpose()?
-                .or(Some(timezone.clone()));
-
-            // Job webhooks extend runner webhooks
-            let mut webhook = runner_webhook.clone();
-            webhook.extend(job.webhook);
-
-            let log_max_size = parse_size(&job.log_max_size)
-                .map_err(|e| anyhow!("Invalid log_max_size in job '{}': {}", id, e))?;
-
-            Ok(Job {
-                id,
-                name,
-                schedule,
-                command: job.run,
-                timeout,
-                concurrency: job.concurrency,
-                retry,
-                working_dir: job.working_dir,
-                jitter,
-                enabled: job.enabled.unwrap_or(true),
-                timezone: job_timezone,
-                env_file: job.env_file,
-                env: job.env,
-                webhook,
-                log_file: job.log_file,
-                log_max_size,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .filter_map(
+            |(id, job)| match parse_job(&id, job, &timezone, &runner_webhook) {
+                Ok(job) => Some(job),
+                Err(e) => {
+                    warn!("Skipping job '{}': {}", id, e);
+                    None
+                }
+            },
+        )
+        .collect();
 
     Ok((runner, jobs))
+}
+
+fn parse_job(
+    id: &str,
+    job: JobConfig,
+    timezone: &TimezoneConfig,
+    runner_webhook: &[WebhookConfig],
+) -> Result<Job> {
+    validate_job_id(id)?;
+
+    // Validate 5-field cron format
+    let cron_fields: Vec<&str> = job.schedule.cron.split_whitespace().collect();
+    if cron_fields.len() != 5 {
+        anyhow::bail!(
+            "Invalid cron '{}': expected 5 fields (minute hour day month weekday), got {}",
+            job.schedule.cron,
+            cron_fields.len()
+        );
+    }
+
+    // Convert 5-field cron to 6-field by prepending seconds (0)
+    // Also normalize day-of-week: 0 → 7 (cron crate uses 1-7, not 0-6)
+    let normalized_cron = normalize_cron(&job.schedule.cron);
+    let schedule_str = format!("0 {}", normalized_cron);
+    let schedule = Schedule::from_str(&schedule_str)
+        .map_err(|e| anyhow!("Invalid cron '{}': {}", job.schedule.cron, e))?;
+
+    let timeout = parse_duration(&job.timeout)
+        .map_err(|e| anyhow!("Invalid timeout '{}': {}", job.timeout, e))?;
+
+    let name = job.name.unwrap_or_else(|| id.to_string());
+
+    let retry = job
+        .retry
+        .map(|r| {
+            if r.max == 0 {
+                anyhow::bail!(
+                    "Invalid retry.max '0': must be at least 1 (use no retry config to disable retries)"
+                );
+            }
+            let delay = parse_duration(&r.delay)
+                .map_err(|e| anyhow!("Invalid retry delay '{}': {}", r.delay, e))?;
+            let jitter = r
+                .jitter
+                .map(|j| parse_duration(&j).map_err(|e| anyhow!("Invalid retry jitter '{}': {}", j, e)))
+                .transpose()?;
+            Ok::<_, anyhow::Error>(RetryConfig {
+                max: r.max,
+                delay,
+                jitter,
+            })
+        })
+        .transpose()?;
+
+    let jitter = job
+        .jitter
+        .map(|j| parse_duration(&j).map_err(|e| anyhow!("Invalid jitter '{}': {}", j, e)))
+        .transpose()?;
+
+    let job_timezone = job
+        .schedule
+        .timezone
+        .map(|tz| {
+            if tz == "inherit" {
+                Ok(TimezoneConfig::Inherit)
+            } else {
+                tz.parse::<Tz>()
+                    .map(TimezoneConfig::Named)
+                    .map_err(|e| anyhow!("Invalid timezone '{}': {}", tz, e))
+            }
+        })
+        .transpose()?
+        .or(Some(timezone.clone()));
+
+    // Job webhooks extend runner webhooks
+    let mut webhook = runner_webhook.to_vec();
+    webhook.extend(job.webhook);
+
+    let log_max_size =
+        parse_size(&job.log_max_size).map_err(|e| anyhow!("Invalid log_max_size: {}", e))?;
+
+    Ok(Job {
+        id: id.to_string(),
+        name,
+        schedule,
+        command: job.run,
+        timeout,
+        concurrency: job.concurrency,
+        retry,
+        working_dir: job.working_dir,
+        jitter,
+        enabled: job.enabled.unwrap_or(true),
+        timezone: job_timezone,
+        env_file: job.env_file,
+        env: job.env,
+        webhook,
+        log_file: job.log_file,
+        log_max_size,
+    })
 }
 
 fn parse_duration(s: &str) -> Result<Duration> {
@@ -565,7 +593,10 @@ jobs:
     run: echo test
 "#;
         let (runner, _) = parse_config(yaml).unwrap();
-        assert_eq!(runner.timezone, TimezoneConfig::Named(chrono_tz::Asia::Tokyo));
+        assert_eq!(
+            runner.timezone,
+            TimezoneConfig::Named(chrono_tz::Asia::Tokyo)
+        );
     }
 
     #[test]
@@ -678,11 +709,14 @@ jobs:
     #[test]
     fn parse_duration_milliseconds() {
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
-        assert_eq!(parse_duration("1000ms").unwrap(), Duration::from_millis(1000));
+        assert_eq!(
+            parse_duration("1000ms").unwrap(),
+            Duration::from_millis(1000)
+        );
     }
 
     #[test]
-    fn reject_invalid_job_id() {
+    fn skip_invalid_job_id() {
         let yaml = r#"
 jobs:
   "../escape":
@@ -690,11 +724,12 @@ jobs:
       cron: "* * * * *"
     run: echo test
 "#;
-        assert!(parse_config(yaml).is_err());
+        let (_, jobs) = parse_config(yaml).unwrap();
+        assert!(jobs.is_empty()); // Invalid job is skipped
     }
 
     #[test]
-    fn reject_job_id_with_slash() {
+    fn skip_job_id_with_slash() {
         let yaml = r#"
 jobs:
   "foo/bar":
@@ -702,7 +737,8 @@ jobs:
       cron: "* * * * *"
     run: echo test
 "#;
-        assert!(parse_config(yaml).is_err());
+        let (_, jobs) = parse_config(yaml).unwrap();
+        assert!(jobs.is_empty()); // Invalid job is skipped
     }
 
     #[test]
@@ -719,7 +755,7 @@ jobs:
     }
 
     #[test]
-    fn reject_retry_max_zero() {
+    fn skip_retry_max_zero() {
         let yaml = r#"
 jobs:
   test:
@@ -729,7 +765,8 @@ jobs:
     retry:
       max: 0
 "#;
-        assert!(parse_config(yaml).is_err());
+        let (_, jobs) = parse_config(yaml).unwrap();
+        assert!(jobs.is_empty()); // Invalid job is skipped
     }
 
     #[test]
@@ -790,7 +827,10 @@ jobs:
     run: echo test
 "#;
         let (runner, jobs) = parse_config(yaml).unwrap();
-        assert_eq!(runner.timezone, TimezoneConfig::Named(chrono_tz::Asia::Tokyo));
+        assert_eq!(
+            runner.timezone,
+            TimezoneConfig::Named(chrono_tz::Asia::Tokyo)
+        );
         let find = |id: &str| jobs.iter().find(|j| j.id == id).unwrap();
         assert_eq!(
             find("job1").timezone,
@@ -817,7 +857,7 @@ jobs:
     }
 
     #[test]
-    fn parse_invalid_job_timezone() {
+    fn skip_invalid_job_timezone() {
         let yaml = r#"
 jobs:
   test:
@@ -826,7 +866,8 @@ jobs:
       timezone: Invalid/Zone
     run: echo test
 "#;
-        assert!(parse_config(yaml).is_err());
+        let (_, jobs) = parse_config(yaml).unwrap();
+        assert!(jobs.is_empty()); // Invalid job is skipped
     }
 
     #[test]
@@ -1032,5 +1073,18 @@ jobs:
         assert_eq!(normalize_dow_field("10"), "10"); // Invalid but should not be mangled
         assert_eq!(normalize_dow_field("1-5"), "1-5");
         assert_eq!(normalize_dow_field("20"), "20"); // Invalid but should not be mangled
+    }
+
+    #[test]
+    fn skip_6_field_cron() {
+        let yaml = r#"
+jobs:
+  test:
+    schedule:
+      cron: "0 0 7 * * 7"
+    run: echo test
+"#;
+        let (_, jobs) = parse_config(yaml).unwrap();
+        assert!(jobs.is_empty()); // Invalid job is skipped
     }
 }
