@@ -1,12 +1,14 @@
 mod executor;
 mod tick;
 
+use crate::actor::runner::{JobCompleted, JobFailed, RunnerActor};
 use crate::config::{Concurrency, Job, RunnerConfig};
 use crate::git;
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 use xtra::prelude::*;
+use xtra::refcount::Weak;
 
 use executor::execute_job;
 use tick::is_job_due;
@@ -16,6 +18,7 @@ pub struct JobActor {
     job: Job,
     sot_path: PathBuf,
     runner: RunnerConfig,
+    runner_addr: Option<Address<RunnerActor, Weak>>,
     pending_sync: bool,
     handles: Vec<JoinHandle<()>>,
     tick_handle: Option<JoinHandle<()>>,
@@ -23,11 +26,17 @@ pub struct JobActor {
 }
 
 impl JobActor {
-    pub fn new(job: Job, sot_path: PathBuf, runner: RunnerConfig) -> Self {
+    pub fn new(
+        job: Job,
+        sot_path: PathBuf,
+        runner: RunnerConfig,
+        runner_addr: Option<Address<RunnerActor, Weak>>,
+    ) -> Self {
         Self {
             job,
             sot_path,
             runner,
+            runner_addr,
             pending_sync: true, // Initial sync needed
             handles: Vec::new(),
             tick_handle: None,
@@ -222,30 +231,61 @@ impl JobActor {
     }
 
     fn spawn_job(&mut self) {
+        let job_id = self.job.id.clone();
         let job = self.job.clone();
         let sot_path = self.sot_path.clone();
         let runner = self.runner.clone();
+        let runner_addr = self.runner_addr.clone();
 
         let handle = tokio::spawn(async move {
-            execute_job(&job, &sot_path, &runner).await;
+            let success = execute_job(&job, &sot_path, &runner).await;
+            if let Some(addr) = runner_addr {
+                let msg = if success {
+                    Either::Left(JobCompleted { job_id })
+                } else {
+                    Either::Right(JobFailed { job_id })
+                };
+                match msg {
+                    Either::Left(m) => { let _ = addr.send(m).await; }
+                    Either::Right(m) => { let _ = addr.send(m).await; }
+                }
+            }
         });
 
         self.handles.push(handle);
     }
 
     fn spawn_waiting_job(&mut self) {
+        let job_id = self.job.id.clone();
         let job = self.job.clone();
         let sot_path = self.sot_path.clone();
         let runner = self.runner.clone();
+        let runner_addr = self.runner_addr.clone();
         let previous_handles = std::mem::take(&mut self.handles);
 
         let handle = tokio::spawn(async move {
             for prev_handle in previous_handles {
                 let _ = prev_handle.await;
             }
-            execute_job(&job, &sot_path, &runner).await;
+            let success = execute_job(&job, &sot_path, &runner).await;
+            if let Some(addr) = runner_addr {
+                let msg = if success {
+                    Either::Left(JobCompleted { job_id })
+                } else {
+                    Either::Right(JobFailed { job_id })
+                };
+                match msg {
+                    Either::Left(m) => { let _ = addr.send(m).await; }
+                    Either::Right(m) => { let _ = addr.send(m).await; }
+                }
+            }
         });
 
         self.handles.push(handle);
     }
+}
+
+enum Either<L, R> {
+    Left(L),
+    Right(R),
 }

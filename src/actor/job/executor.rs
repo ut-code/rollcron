@@ -27,7 +27,7 @@ pub struct WebhookPayload {
     pub attempts: u32,
 }
 
-pub async fn execute_job(job: &Job, sot_path: &PathBuf, runner: &RunnerConfig) {
+pub async fn execute_job(job: &Job, sot_path: &PathBuf, runner: &RunnerConfig) -> bool {
     let job_dir = git::get_job_dir(sot_path, &job.id);
     let work_dir = resolve_work_dir(sot_path, &job.id, &job.working_dir);
     let mut log_file = job
@@ -75,7 +75,7 @@ pub async fn execute_job(job: &Job, sot_path: &PathBuf, runner: &RunnerConfig) {
         let success = handle_result(job, &result, log_file.as_mut());
 
         if success {
-            return;
+            return true;
         }
 
         last_result = Some(result);
@@ -113,6 +113,8 @@ pub async fn execute_job(job: &Job, sot_path: &PathBuf, runner: &RunnerConfig) {
             send_webhook(&webhook.to_url(), &payload).await;
         }
     }
+
+    false
 }
 
 fn resolve_work_dir(sot_path: &PathBuf, job_id: &str, working_dir: &Option<String>) -> PathBuf {

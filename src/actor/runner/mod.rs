@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use xtra::prelude::*;
+use xtra::refcount::Weak;
 
 const CONFIG_FILE: &str = "rollcron.yaml";
 
@@ -22,6 +23,7 @@ pub struct RunnerActor {
     job_actors: HashMap<String, Address<JobActor>>,
     poll_handle: Option<JoinHandle<()>>,
     supervisor_handle: Option<JoinHandle<()>>,
+    self_addr: Option<Address<Self, Weak>>,
 }
 
 impl RunnerActor {
@@ -39,12 +41,19 @@ impl RunnerActor {
             job_actors: HashMap::new(),
             poll_handle: None,
             supervisor_handle: None,
+            self_addr: None,
         }
     }
 
     fn spawn_job_actor(&mut self, job: Job) {
         let job_id = job.id.clone();
-        let actor = JobActor::new(job, self.sot_path.clone(), self.runner_config.clone());
+        let runner_addr = self.self_addr.clone();
+        let actor = JobActor::new(
+            job,
+            self.sot_path.clone(),
+            self.runner_config.clone(),
+            runner_addr,
+        );
         let addr = xtra::spawn_tokio(actor, Mailbox::unbounded());
         self.job_actors.insert(job_id, addr);
     }
@@ -55,6 +64,7 @@ impl Actor for RunnerActor {
 
     async fn started(&mut self, mailbox: &Mailbox<Self>) -> Result<(), Self::Stop> {
         let addr = mailbox.address();
+        self.self_addr = Some(addr.clone());
 
         // Start git poll loop
         let source = self.source.clone();
@@ -82,9 +92,11 @@ impl Actor for RunnerActor {
             handle.abort();
         }
 
-        // Shutdown all job actors
+        // Shutdown all job actors (fire-and-forget)
         for (_, addr) in self.job_actors.drain() {
-            let _ = addr.send(Shutdown).await;
+            tokio::spawn(async move {
+                let _ = addr.send(Shutdown).await;
+            });
         }
 
         info!(target: "rollcron::runner", "Runner actor stopped");
@@ -142,24 +154,26 @@ impl Handler<ConfigUpdate> for RunnerActor {
             .cloned()
             .collect();
 
-        // Remove deleted jobs
+        // Remove deleted jobs (fire-and-forget)
         for job_id in to_remove {
             if let Some(addr) = self.job_actors.remove(&job_id) {
                 info!(target: "rollcron::runner", job_id = %job_id, "Removing job actor");
-                let _ = addr.send(Shutdown).await;
+                tokio::spawn(async move {
+                    let _ = addr.send(Shutdown).await;
+                });
             }
         }
 
         // Update or create jobs
         for (job_id, job) in new_job_ids {
             if let Some(addr) = self.job_actors.get(&job_id) {
-                // Update existing job
-                let _ = addr
-                    .send(SyncNeeded {
-                        sot_path: msg.sot_path.clone(),
-                    })
-                    .await;
-                let _ = addr.send(Update(job)).await;
+                // Update existing job (fire-and-forget)
+                let addr = addr.clone();
+                let sot_path = msg.sot_path.clone();
+                tokio::spawn(async move {
+                    let _ = addr.send(SyncNeeded { sot_path }).await;
+                    let _ = addr.send(Update(job)).await;
+                });
             } else {
                 // Create new job
                 let job_dir = git::get_job_dir(&self.sot_path, &job_id);
@@ -236,5 +250,31 @@ impl Handler<GracefulShutdown> for RunnerActor {
         }
 
         ctx.stop_self();
+    }
+}
+
+/// Job execution completed successfully
+pub struct JobCompleted {
+    pub job_id: String,
+}
+
+impl Handler<JobCompleted> for RunnerActor {
+    type Return = ();
+
+    async fn handle(&mut self, msg: JobCompleted, _ctx: &mut Context<Self>) {
+        info!(target: "rollcron::runner", job_id = %msg.job_id, "Job completed");
+    }
+}
+
+/// Job execution failed after all retries
+pub struct JobFailed {
+    pub job_id: String,
+}
+
+impl Handler<JobFailed> for RunnerActor {
+    type Return = ();
+
+    async fn handle(&mut self, msg: JobFailed, _ctx: &mut Context<Self>) {
+        warn!(target: "rollcron::runner", job_id = %msg.job_id, "Job failed");
     }
 }
