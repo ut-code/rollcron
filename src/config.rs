@@ -81,6 +81,7 @@ pub struct RunnerConfig {
     pub timezone: TimezoneConfig,
     pub env_file: Option<String>,
     pub env: Option<HashMap<String, String>>,
+    pub webhook: Vec<WebhookConfig>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -205,6 +206,7 @@ pub fn parse_config(content: &str) -> Result<(RunnerConfig, Vec<Job>)> {
         timezone: timezone.clone(),
         env_file: config.runner.env_file,
         env: config.runner.env,
+        webhook: runner_webhook.clone(),
     };
 
     let jobs = config

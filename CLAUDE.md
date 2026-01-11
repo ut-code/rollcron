@@ -17,11 +17,12 @@ src/
 │   └── job/                # Job Actor - single job control
 │       ├── mod.rs          # Actor definition, state machine
 │       ├── tick.rs         # cron evaluation, jitter
-│       └── executor.rs     # command execution, retry, timeout, logging
+│       └── executor.rs     # command execution, retry, timeout
 ├── config.rs               # YAML config parsing, Job struct
 ├── git.rs                  # Git operations (clone, pull, archive)
 ├── env.rs                  # Environment variable handling
-└── logging.rs              # Logging setup
+├── logging.rs              # Logging setup
+└── webhook.rs              # Discord webhook notifications
 ```
 
 ## Key Types
@@ -163,7 +164,9 @@ jobs:
 
 ## Webhooks
 
-Webhooks send notifications on job failure. Configure at runner level (inherited by all jobs) or job level.
+Webhooks send Discord notifications for:
+- **Job failures** (after all retries exhausted)
+- **Config parse errors** (runner-level webhooks only)
 
 ```yaml
 runner:
@@ -174,9 +177,11 @@ runner:
 
 **Format**: `{ type?: "discord", url: string }` where `type` defaults to "discord".
 
-**Payload**: JSON with `text`, `job_id`, `job_name`, `error`, `stderr`, `attempts`.
+**Payloads**:
+- Job failure: Discord embed (red) with Job, Attempts, Error, Stderr fields
+- Config error: Discord embed (orange) with Error field
 
-**Inheritance**: Job webhooks extend runner webhooks (both are notified).
+**Inheritance**: Job webhooks extend runner webhooks (both are notified on job failure).
 
 ## Environment Variables
 

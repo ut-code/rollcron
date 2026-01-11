@@ -199,6 +199,17 @@ impl Handler<GetJobActors> for RunnerActor {
     }
 }
 
+/// Get runner config for webhook notifications
+pub struct GetRunnerConfig;
+
+impl Handler<GetRunnerConfig> for RunnerActor {
+    type Return = RunnerConfig;
+
+    async fn handle(&mut self, _msg: GetRunnerConfig, _ctx: &mut Context<Self>) -> Self::Return {
+        self.runner_config.clone()
+    }
+}
+
 /// Respawn a job actor that died unexpectedly
 pub struct RespawnJob {
     pub job_id: String,

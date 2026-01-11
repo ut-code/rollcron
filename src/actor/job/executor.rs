@@ -1,5 +1,4 @@
 use rand::Rng;
-use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -12,20 +11,10 @@ use tracing::{debug, error, info, warn};
 use crate::config::{Job, RetryConfig, RunnerConfig};
 use crate::env;
 use crate::git;
+use crate::webhook::{self, JobFailure};
 
 /// Default jitter ratio when not explicitly configured (25% of base delay)
 const AUTO_JITTER_RATIO: u32 = 25;
-
-/// Webhook notification payload
-#[derive(Debug, Serialize)]
-pub struct WebhookPayload {
-    pub text: String,
-    pub job_id: String,
-    pub job_name: String,
-    pub error: String,
-    pub stderr: String,
-    pub attempts: u32,
-}
 
 pub async fn execute_job(job: &Job, sot_path: &PathBuf, runner: &RunnerConfig) -> bool {
     let job_dir = git::get_job_dir(sot_path, &job.id);
@@ -100,18 +89,17 @@ pub async fn execute_job(job: &Job, sot_path: &PathBuf, runner: &RunnerConfig) -
             None => ("unknown error".to_string(), String::new()),
         };
 
-        let payload = WebhookPayload {
-            text: format!("[rollcron] Job '{}' failed", job.name),
-            job_id: job.id.clone(),
-            job_name: job.name.clone(),
+        let failure = JobFailure {
+            job_id: &job.id,
+            job_name: &job.name,
             error,
             stderr,
             attempts: max_attempts,
         };
 
         let runner_env = load_runner_env_vars(sot_path, runner);
-        for webhook in &job.webhook {
-            let url = webhook.to_url(runner_env.as_ref());
+        for wh in &job.webhook {
+            let url = wh.to_url(runner_env.as_ref());
             if url.contains('$') {
                 warn!(
                     target: "rollcron::webhook",
@@ -130,7 +118,7 @@ pub async fn execute_job(job: &Job, sot_path: &PathBuf, runner: &RunnerConfig) -
                 );
                 continue;
             }
-            send_webhook(&url, &payload).await;
+            webhook::send_job_failure(&url, &failure).await;
         }
     }
 
@@ -376,23 +364,6 @@ fn create_log_file(job_dir: &PathBuf, log_path: &str, max_size: u64) -> Option<F
     }
 }
 
-// === Webhook ===
-
-async fn send_webhook(url: &str, payload: &WebhookPayload) {
-    let client = reqwest::Client::new();
-    match client.post(url).json(payload).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            info!(target: "rollcron::webhook", url = %url, "Notification sent");
-        }
-        Ok(resp) => {
-            error!(target: "rollcron::webhook", url = %url, status = %resp.status(), "Failed to send notification");
-        }
-        Err(e) => {
-            error!(target: "rollcron::webhook", url = %url, error = %e, "Failed to send notification");
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +398,7 @@ mod tests {
             timezone: TimezoneConfig::Utc,
             env_file: None,
             env: None,
+            webhook: vec![],
         }
     }
 

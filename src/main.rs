@@ -3,6 +3,7 @@ mod config;
 mod env;
 mod git;
 mod logging;
+mod webhook;
 
 use actor::runner::{GracefulShutdown, Initialize, RunnerActor};
 use anyhow::{Context, Result};
