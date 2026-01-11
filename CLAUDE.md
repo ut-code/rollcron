@@ -8,10 +8,20 @@ rollcron is a Rust CLI tool that functions as a self-updating cron scheduler, si
 
 ```
 src/
-├── main.rs       # Entry point, CLI parsing, orchestration
-├── config.rs     # YAML config parsing, Job struct
-├── git.rs        # Git operations (clone, pull, archive)
-└── scheduler.rs  # Cron scheduling, job execution
+├── main.rs                 # Entry point, CLI parsing
+├── actor/
+│   ├── runner/             # Runner Actor - lifecycle management
+│   │   ├── mod.rs          # Actor definition, messages
+│   │   ├── git_poll.rs     # git fetch/reset loop
+│   │   └── lifecycle.rs    # Job Actor supervision
+│   └── job/                # Job Actor - single job control
+│       ├── mod.rs          # Actor definition, state machine
+│       ├── tick.rs         # cron evaluation, jitter
+│       └── executor.rs     # command execution, retry, timeout, logging
+├── config.rs               # YAML config parsing, Job struct
+├── git.rs                  # Git operations (clone, pull, archive)
+├── env.rs                  # Environment variable handling
+└── logging.rs              # Logging setup
 ```
 
 ## Key Types

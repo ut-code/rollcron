@@ -1,16 +1,15 @@
+mod actor;
 mod config;
 mod env;
 mod git;
 mod logging;
-mod scheduler;
 
+use actor::runner::{GracefulShutdown, Initialize, RunnerActor};
 use anyhow::{Context, Result};
 use clap::Parser;
-use scheduler::{ConfigUpdate, Scheduler, SyncRequest};
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::time::interval;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use xtra::prelude::*;
 
 const CONFIG_FILE: &str = "rollcron.yaml";
@@ -51,77 +50,29 @@ async fn main() -> Result<()> {
 
     let (initial_runner, initial_jobs) = load_config(&sot_path)?;
 
-    // Initial sync of all job directories
-    for job in &initial_jobs {
-        let job_dir = git::get_job_dir(&sot_path, &job.id);
-        git::sync_to_job_dir(&sot_path, &job_dir)?;
-    }
-
-    // Spawn Scheduler actor
-    let scheduler = xtra::spawn_tokio(
-        Scheduler::new(initial_jobs, sot_path.clone(), initial_runner),
+    // Spawn Runner actor
+    let runner = xtra::spawn_tokio(
+        RunnerActor::new(
+            source,
+            Duration::from_secs(args.pull_interval),
+            sot_path,
+            initial_runner,
+        ),
         Mailbox::unbounded(),
     );
 
-    // Spawn auto-sync task
-    let source_clone = source.clone();
-    let pull_interval = args.pull_interval;
-    let scheduler_clone = scheduler.clone();
-    let sync_handle = tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(pull_interval));
-        loop {
-            ticker.tick().await;
-
-            let (sot, update_info) = match git::ensure_repo(&source_clone) {
-                Ok(r) => r,
-                Err(e) => {
-                    error!(error = %e, "Sync failed");
-                    continue;
-                }
-            };
-
-            let Some(range) = update_info else {
-                continue;
-            };
-
-            info!(range = %range, "Pulled updates");
-
-            match load_config(&sot) {
-                Ok((runner, jobs)) => {
-                    // Mark all jobs as needing sync
-                    let job_ids: Vec<String> = jobs.iter().map(|j| j.id.clone()).collect();
-                    if let Err(e) = scheduler_clone
-                        .send(SyncRequest {
-                            job_ids,
-                            sot_path: sot,
-                        })
-                        .await
-                    {
-                        error!(error = %e, "Failed to queue sync");
-                        continue;
-                    }
-                    // Update config
-                    if let Err(e) = scheduler_clone.send(ConfigUpdate { jobs, runner }).await {
-                        error!(error = %e, "Failed to update config");
-                    }
-                }
-                Err(e) => error!(error = %e, "Failed to reload config"),
-            }
-        }
-    });
-
-    // Wait for shutdown signal or task panic
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("Shutting down...");
-        }
-        result = sync_handle => {
-            match result {
-                Ok(()) => warn!("Sync task exited unexpectedly"),
-                Err(e) => error!(error = %e, "Sync task panicked"),
-            }
-        }
+    // Initialize with jobs
+    if let Err(e) = runner.send(Initialize { jobs: initial_jobs }).await {
+        error!(error = %e, "Failed to initialize jobs");
+        return Ok(());
     }
+
+    // Wait for shutdown signal
+    tokio::signal::ctrl_c().await?;
+    info!("Shutting down...");
+
+    // Graceful shutdown
+    let _ = runner.send(GracefulShutdown).await;
 
     Ok(())
 }
