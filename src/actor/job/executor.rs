@@ -109,8 +109,9 @@ pub async fn execute_job(job: &Job, sot_path: &PathBuf, runner: &RunnerConfig) -
             attempts: max_attempts,
         };
 
+        let runner_env = load_runner_env_vars(sot_path, runner);
         for webhook in &job.webhook {
-            send_webhook(&webhook.to_url(), &payload).await;
+            send_webhook(&webhook.to_url(runner_env.as_ref()), &payload).await;
         }
     }
 
@@ -176,6 +177,37 @@ async fn run_command(
         Ok(Err(e)) => CommandResult::ExecError(e.to_string()),
         Err(_) => CommandResult::Timeout,
     }
+}
+
+/// Load runner-level env vars for webhook URL expansion.
+/// Returns None on error (webhook will fall back to process env).
+fn load_runner_env_vars(
+    sot_path: &PathBuf,
+    runner: &RunnerConfig,
+) -> Option<HashMap<String, String>> {
+    let mut env_vars = HashMap::new();
+
+    // Load runner.env_file
+    if let Some(env_file_path) = &runner.env_file {
+        let expanded = env::expand_string(env_file_path);
+        let full_path = sot_path.join(&expanded);
+        match env::load_env_from_path(&full_path) {
+            Ok(vars) => env_vars.extend(vars),
+            Err(e) => {
+                warn!(target: "rollcron::webhook", error = %e, "Failed to load runner env_file");
+                return None;
+            }
+        }
+    }
+
+    // Merge runner.env
+    if let Some(runner_env) = &runner.env {
+        for (k, v) in runner_env {
+            env_vars.insert(k.clone(), env::expand_string(v));
+        }
+    }
+
+    Some(env_vars)
 }
 
 fn merge_env_vars(

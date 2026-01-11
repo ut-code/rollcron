@@ -41,6 +41,12 @@ struct Job {
     log_max_size: u64,         // Max log size before rotation (default: 10M)
     env_file: Option<String>,  // Path to .env file (relative to job dir)
     env: Option<HashMap<String, String>>,  // Inline env vars
+    webhook: Vec<WebhookConfig>,  // Failure notifications (inherited from runner + job-level)
+}
+
+struct WebhookConfig {
+    webhook_type: String,  // Currently only "discord" (default)
+    url: String,           // Webhook URL (supports $ENV_VAR expansion)
 }
 
 struct RetryConfig {
@@ -70,6 +76,10 @@ runner:                        # Optional: global settings
   env_file: .env               # Optional: load env vars from file
   env:                         # Optional: inline env vars
     KEY: value
+  webhook:                     # Optional: failure notifications (inherited by all jobs)
+    - url: $DISCORD_WEBHOOK_URL  # URL or $ENV_VAR (loaded from runner.env_file)
+    - type: discord              # Optional: defaults to "discord"
+      url: https://discord.com/api/webhooks/...
 
 jobs:
   <job-id>:                  # Key = ID (used for directories)
@@ -150,6 +160,23 @@ jobs:
 3. New `backup.log` created
 
 **Size format**: `10M` (megabytes), `1G` (gigabytes), `512K` (kilobytes), or bytes
+
+## Webhooks
+
+Webhooks send notifications on job failure. Configure at runner level (inherited by all jobs) or job level.
+
+```yaml
+runner:
+  env_file: .env               # Load DISCORD_WEBHOOK_URL from here
+  webhook:
+    - url: $DISCORD_WEBHOOK_URL  # Expanded from env_file
+```
+
+**Format**: `{ type?: "discord", url: string }` where `type` defaults to "discord".
+
+**Payload**: JSON with `text`, `job_id`, `job_name`, `error`, `stderr`, `attempts`.
+
+**Inheritance**: Job webhooks extend runner webhooks (both are notified).
 
 ## Environment Variables
 

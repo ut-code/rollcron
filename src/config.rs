@@ -31,31 +31,48 @@ pub enum TimezoneConfig {
     Named(Tz),
 }
 
-/// Webhook configuration - either a URL or Discord id/token pair
+/// Webhook configuration for failure notifications
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(untagged)]
-pub enum WebhookConfig {
-    Url { url: String },
-    Discord { id: String, token: String },
+pub struct WebhookConfig {
+    /// Webhook type (currently only "discord" supported)
+    #[serde(rename = "type", default = "default_webhook_type")]
+    pub webhook_type: String,
+    /// Webhook URL (supports $ENV_VAR expansion)
+    pub url: String,
+}
+
+fn default_webhook_type() -> String {
+    "discord".to_string()
 }
 
 impl WebhookConfig {
-    /// Convert to URL string, expanding environment variables
-    pub fn to_url(&self) -> String {
-        match self {
-            WebhookConfig::Url { url } => shellexpand::full(url)
-                .map(|s| s.into_owned())
-                .unwrap_or_else(|_| url.clone()),
-            WebhookConfig::Discord { id, token } => {
-                let id = shellexpand::full(id)
-                    .map(|s| s.into_owned())
-                    .unwrap_or_else(|_| id.clone());
-                let token = shellexpand::full(token)
-                    .map(|s| s.into_owned())
-                    .unwrap_or_else(|_| token.clone());
-                format!("https://discord.com/api/webhooks/{}/{}", id, token)
-            }
+    /// Convert to URL string, expanding environment variables.
+    /// If env_vars is provided, uses those for $VAR expansion.
+    /// Falls back to process environment for undefined variables.
+    pub fn to_url(&self, env_vars: Option<&std::collections::HashMap<String, String>>) -> String {
+        expand_with_env(&self.url, env_vars)
+    }
+}
+
+/// Expand shell-like variables in a string.
+/// Uses provided env_vars first, then falls back to process environment.
+fn expand_with_env(
+    s: &str,
+    env_vars: Option<&std::collections::HashMap<String, String>>,
+) -> String {
+    match env_vars {
+        Some(vars) => {
+            let home_dir = || dirs::home_dir().map(|p| p.to_string_lossy().into_owned());
+            shellexpand::full_with_context_no_errors(s, home_dir, |var| {
+                vars.get(var)
+                    .map(|v| std::borrow::Cow::Borrowed(v.as_str()))
+                    .or_else(|| std::env::var(var).ok().map(std::borrow::Cow::Owned))
+            })
+            .into_owned()
         }
+        None => shellexpand::full(s)
+            .map(|s| s.into_owned())
+            .unwrap_or_else(|_| s.to_string()),
     }
 }
 
@@ -900,7 +917,7 @@ jobs:
         let (_, jobs) = parse_config(yaml).unwrap();
         // Job inherits runner webhook
         assert_eq!(jobs[0].webhook.len(), 1);
-        assert_eq!(jobs[0].webhook[0].to_url(), "https://hooks.slack.com/test");
+        assert_eq!(jobs[0].webhook[0].to_url(None), "https://hooks.slack.com/test");
     }
 
     #[test]
@@ -944,13 +961,13 @@ jobs:
       cron: "* * * * *"
     run: echo test
     webhook:
-      - id: "123456"
-        token: "abcdef"
+      - url: https://discord.com/api/webhooks/123456/abcdef
 "#;
         let (_, jobs) = parse_config(yaml).unwrap();
         assert_eq!(jobs[0].webhook.len(), 1);
+        assert_eq!(jobs[0].webhook[0].webhook_type, "discord");
         assert_eq!(
-            jobs[0].webhook[0].to_url(),
+            jobs[0].webhook[0].to_url(None),
             "https://discord.com/api/webhooks/123456/abcdef"
         );
     }
@@ -966,11 +983,46 @@ jobs:
     webhook:
       - url: https://hooks.slack.com/first
       - url: https://hooks.slack.com/second
-      - id: discord_id
-        token: discord_token
+      - type: discord
+        url: https://discord.com/api/webhooks/id/token
 "#;
         let (_, jobs) = parse_config(yaml).unwrap();
         assert_eq!(jobs[0].webhook.len(), 3);
     }
 
+    #[test]
+    fn parse_webhook_with_explicit_type() {
+        let yaml = r#"
+jobs:
+  test:
+    schedule:
+      cron: "* * * * *"
+    run: echo test
+    webhook:
+      - type: discord
+        url: https://discord.com/api/webhooks/test
+"#;
+        let (_, jobs) = parse_config(yaml).unwrap();
+        assert_eq!(jobs[0].webhook.len(), 1);
+        assert_eq!(jobs[0].webhook[0].webhook_type, "discord");
+    }
+
+    #[test]
+    fn webhook_env_var_expansion() {
+        let mut env_vars = HashMap::new();
+        env_vars.insert(
+            "DISCORD_WEBHOOK".to_string(),
+            "https://discord.com/api/webhooks/from_env".to_string(),
+        );
+
+        let webhook = WebhookConfig {
+            webhook_type: "discord".to_string(),
+            url: "$DISCORD_WEBHOOK".to_string(),
+        };
+
+        assert_eq!(
+            webhook.to_url(Some(&env_vars)),
+            "https://discord.com/api/webhooks/from_env"
+        );
+    }
 }
