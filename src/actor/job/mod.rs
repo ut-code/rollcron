@@ -4,14 +4,17 @@ mod tick;
 use crate::actor::runner::{JobCompleted, JobFailed, RunnerActor};
 use crate::config::{Concurrency, Job, RunnerConfig};
 use crate::git;
+use chrono::Utc;
 use std::path::PathBuf;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::{sleep_until, Instant};
 use tracing::{error, info};
 use xtra::prelude::*;
 use xtra::refcount::Weak;
 
 use executor::execute_job;
-use tick::is_job_due;
+use tick::next_occurrence;
 
 /// Job Actor - manages a single job's lifecycle
 pub struct JobActor {
@@ -21,7 +24,8 @@ pub struct JobActor {
     runner_addr: Option<Address<RunnerActor, Weak>>,
     pending_sync: bool,
     handles: Vec<JoinHandle<()>>,
-    tick_handle: Option<JoinHandle<()>>,
+    scheduler_handle: Option<JoinHandle<()>>,
+    config_tx: watch::Sender<(Job, RunnerConfig)>,
     stopping: bool,
 }
 
@@ -32,6 +36,7 @@ impl JobActor {
         runner: RunnerConfig,
         runner_addr: Option<Address<RunnerActor, Weak>>,
     ) -> Self {
+        let (config_tx, _) = watch::channel((job.clone(), runner.clone()));
         Self {
             job,
             sot_path,
@@ -39,7 +44,8 @@ impl JobActor {
             runner_addr,
             pending_sync: true, // Initial sync needed
             handles: Vec::new(),
-            tick_handle: None,
+            scheduler_handle: None,
+            config_tx,
             stopping: false,
         }
     }
@@ -63,28 +69,89 @@ impl JobActor {
     fn running_count(&self) -> usize {
         self.handles.len()
     }
+
+    fn start_scheduler(&mut self, addr: Address<Self, Weak>) {
+        // Abort existing scheduler if any
+        if let Some(handle) = self.scheduler_handle.take() {
+            handle.abort();
+        }
+
+        let mut config_rx = self.config_tx.subscribe();
+
+        self.scheduler_handle = Some(tokio::spawn(async move {
+            loop {
+                let (job, runner) = config_rx.borrow_and_update().clone();
+
+                if !job.enabled {
+                    // Disabled - wait for config change
+                    if config_rx.changed().await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+
+                let next = match next_occurrence(&job, &runner) {
+                    Some(dt) => dt,
+                    None => {
+                        // No future occurrence, wait for config change
+                        if config_rx.changed().await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                let now = Utc::now();
+                let wait_duration = if next > now {
+                    (next - now).to_std().unwrap_or_default()
+                } else {
+                    std::time::Duration::ZERO
+                };
+                let deadline = Instant::now() + wait_duration;
+
+                info!(
+                    target: "rollcron::job",
+                    job_id = %job.id,
+                    next = %next,
+                    wait_secs = wait_duration.as_secs(),
+                    "Scheduled"
+                );
+
+                tokio::select! {
+                    _ = sleep_until(deadline) => {
+                        // Time to execute - send tick
+                        if addr.send(Tick).await.is_err() {
+                            break;
+                        }
+                    }
+                    result = config_rx.changed() => {
+                        if result.is_err() {
+                            break;
+                        }
+                        // Config changed, recalculate next occurrence
+                        continue;
+                    }
+                }
+            }
+        }));
+    }
+
+    fn update_config(&mut self) {
+        let _ = self.config_tx.send((self.job.clone(), self.runner.clone()));
+    }
 }
 
 impl Actor for JobActor {
     type Stop = ();
 
     async fn started(&mut self, mailbox: &Mailbox<Self>) -> Result<(), Self::Stop> {
-        let addr = mailbox.address();
-        self.tick_handle = Some(tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                if addr.send(Tick).await.is_err() {
-                    break;
-                }
-            }
-        }));
+        self.start_scheduler(mailbox.address());
         info!(target: "rollcron::job", job_id = %self.job.id, "Job actor started");
         Ok(())
     }
 
     async fn stopped(mut self) -> Self::Stop {
-        if let Some(handle) = self.tick_handle.take() {
+        if let Some(handle) = self.scheduler_handle.take() {
             handle.abort();
         }
         for handle in self.handles.drain(..) {
@@ -96,7 +163,7 @@ impl Actor for JobActor {
 
 // === Messages ===
 
-/// Internal tick to check cron schedule
+/// Internal tick to trigger job execution
 struct Tick;
 
 impl Handler<Tick> for JobActor {
@@ -104,10 +171,6 @@ impl Handler<Tick> for JobActor {
 
     async fn handle(&mut self, _msg: Tick, _ctx: &mut Context<Self>) {
         if self.stopping || !self.job.enabled {
-            return;
-        }
-
-        if !is_job_due(&self.job, &self.runner) {
             return;
         }
 
@@ -131,6 +194,7 @@ impl Handler<Update> for JobActor {
 
     async fn handle(&mut self, msg: Update, _ctx: &mut Context<Self>) {
         self.job = msg.0;
+        self.update_config();
         info!(target: "rollcron::job", job_id = %self.job.id, "Job config updated");
     }
 }

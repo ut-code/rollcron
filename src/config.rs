@@ -121,7 +121,6 @@ pub struct JobConfig {
     pub concurrency: Concurrency,
     pub retry: Option<RetryConfigRaw>,
     pub working_dir: Option<String>,
-    pub jitter: Option<String>,
     pub enabled: Option<bool>,
     pub env_file: Option<String>,
     pub env: Option<HashMap<String, String>>,
@@ -169,7 +168,6 @@ pub struct Job {
     pub concurrency: Concurrency,
     pub retry: Option<RetryConfig>,
     pub working_dir: Option<String>,
-    pub jitter: Option<Duration>,
     pub enabled: bool,
     pub timezone: Option<TimezoneConfig>,
     pub env_file: Option<String>,
@@ -264,11 +262,6 @@ fn parse_job(
         })
         .transpose()?;
 
-    let jitter = job
-        .jitter
-        .map(|j| parse_duration(&j).map_err(|e| anyhow!("Invalid jitter '{}': {}", j, e)))
-        .transpose()?;
-
     let job_timezone = job
         .schedule
         .timezone
@@ -300,7 +293,6 @@ fn parse_job(
         concurrency: job.concurrency,
         retry,
         working_dir: job.working_dir,
-        jitter,
         enabled: job.enabled.unwrap_or(true),
         timezone: job_timezone,
         env_file: job.env_file,
@@ -592,27 +584,6 @@ jobs:
     run: echo test
 "#;
         assert!(parse_config(yaml).is_err());
-    }
-
-    #[test]
-    fn parse_jitter() {
-        let yaml = r#"
-jobs:
-  with_jitter:
-    schedule:
-      cron: "* * * * *"
-    run: echo test
-    jitter: 30s
-  no_jitter:
-    schedule:
-      cron: "* * * * *"
-    run: echo test
-"#;
-        let (_, jobs) = parse_config(yaml).unwrap();
-        let find = |id: &str| jobs.iter().find(|j| j.id == id).unwrap();
-
-        assert_eq!(find("with_jitter").jitter, Some(Duration::from_secs(30)));
-        assert!(find("no_jitter").jitter.is_none());
     }
 
     #[test]

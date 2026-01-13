@@ -1,41 +1,26 @@
 use crate::config::{Job, RunnerConfig, TimezoneConfig};
-use chrono::{Local, TimeZone, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use croner::Cron;
-use tracing::info;
 
-/// Tolerance for schedule matching (accounts for 1-second tick interval)
-const SCHEDULE_TOLERANCE_MS: i64 = 1000;
-
-pub fn is_job_due(job: &Job, runner: &RunnerConfig) -> bool {
+/// Returns the next scheduled time for a job, or None if no future occurrence.
+pub fn next_occurrence(job: &Job, runner: &RunnerConfig) -> Option<DateTime<Utc>> {
     let tz_config = job.timezone.as_ref().unwrap_or(&runner.timezone);
     match tz_config {
-        TimezoneConfig::Utc => is_schedule_due(&job.schedule, Utc),
-        TimezoneConfig::Inherit => is_schedule_due(&job.schedule, Local),
-        TimezoneConfig::Named(tz) => is_schedule_due(&job.schedule, *tz),
+        TimezoneConfig::Utc => find_next(&job.schedule, Utc),
+        TimezoneConfig::Inherit => find_next(&job.schedule, Local),
+        TimezoneConfig::Named(tz) => find_next(&job.schedule, *tz),
     }
 }
 
-fn is_schedule_due<Z: TimeZone>(schedule: &Cron, tz: Z) -> bool
+fn find_next<Z: TimeZone>(schedule: &Cron, tz: Z) -> Option<DateTime<Utc>>
 where
     Z::Offset: std::fmt::Display,
 {
     let now = Utc::now().with_timezone(&tz);
-    if let Some(next) = schedule.find_next_occurrence(&now, false).ok() {
-        let until_next = (next.clone() - now.clone()).num_milliseconds();
-        let is_due = until_next <= SCHEDULE_TOLERANCE_MS && until_next >= -SCHEDULE_TOLERANCE_MS;
-        if is_due {
-            info!(
-                target: "rollcron::job",
-                now = %now,
-                next = %next,
-                until_next_ms = until_next,
-                "Schedule matched"
-            );
-        }
-        is_due
-    } else {
-        false
-    }
+    schedule
+        .find_next_occurrence(&now, false)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 #[cfg(test)]

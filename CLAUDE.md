@@ -16,7 +16,7 @@ src/
 │   │   └── lifecycle.rs    # Job Actor supervision
 │   └── job/                # Job Actor - single job control
 │       ├── mod.rs          # Actor definition, state machine
-│       ├── tick.rs         # cron evaluation, jitter
+│       ├── tick.rs         # cron schedule evaluation
 │       └── executor.rs     # command execution, retry, timeout
 ├── config.rs               # YAML config parsing, Job struct
 ├── git.rs                  # Git operations (clone, pull, archive)
@@ -37,7 +37,6 @@ struct Job {
     timeout: Duration,
     concurrency: Concurrency,
     retry: Option<RetryConfig>,
-    jitter: Option<Duration>,  // Random delay before execution (0 to jitter)
     log_file: Option<String>,  // Path to log file (relative to job dir)
     log_max_size: u64,         // Max log size before rotation (default: 10M)
     env_file: Option<String>,  // Path to .env file (relative to job dir)
@@ -65,7 +64,7 @@ struct RunnerConfig {
 
 // Parsed from rollcron.yaml
 struct Config { jobs: HashMap<String, JobConfig> }
-struct JobConfig { name: Option<String>, schedule: ScheduleConfig, run, timeout, jitter }
+struct JobConfig { name: Option<String>, schedule: ScheduleConfig, run, timeout }
 struct ScheduleConfig { cron: String }
 ```
 
@@ -89,7 +88,6 @@ jobs:
       cron: "*/5 * * * *"
     run: echo hello
     timeout: 10s             # Optional (default: 10s)
-    jitter: 30s              # Optional: random delay 0-30s before execution
     concurrency: skip        # Optional: parallel|wait|skip|replace (default: skip)
     retry:                   # Optional
       max: 3                 # Max retry attempts
@@ -139,11 +137,9 @@ jobs:
 4. Send new jobs to scheduler via watch channel
 
 ### Job Execution
-1. Scheduler polls every 1 second
-2. Check each job's cron schedule
-3. If due: spawn task in job's directory (by ID) with timeout
-4. Apply task jitter (random delay 0 to jitter) before first execution
-5. On failure: apply exponential backoff + retry jitter before retry
+1. Each job calculates next occurrence and sleeps until scheduled time
+2. When scheduled time arrives: spawn task in job's directory (by ID) with timeout
+3. On failure: apply exponential backoff + retry jitter before retry
 
 ### Shutdown (Ctrl+C)
 1. Wait for running jobs to complete (graceful stop)

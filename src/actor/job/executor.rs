@@ -24,15 +24,6 @@ pub async fn execute_job(job: &Job, sot_path: &PathBuf, runner: &RunnerConfig) -
         .as_ref()
         .and_then(|p| create_log_file(&job_dir, p, job.log_max_size));
 
-    // Apply task jitter before first execution
-    if let Some(jitter_max) = job.jitter {
-        let jitter = generate_jitter(jitter_max);
-        if jitter > Duration::ZERO {
-            debug!(target: "rollcron::job", job_id = %job.id, jitter = ?jitter, "Applying jitter");
-            sleep(jitter).await;
-        }
-    }
-
     let max_attempts = job.retry.as_ref().map(|r| r.max + 1).unwrap_or(1);
     let mut last_result: Option<CommandResult> = None;
 
@@ -382,7 +373,6 @@ mod tests {
             concurrency: Concurrency::Skip,
             retry: None,
             working_dir: None,
-            jitter: None,
             enabled: true,
             timezone: None,
             env_file: None,
