@@ -42,6 +42,11 @@ pub async fn execute_build(job: &Job, sot_path: &Path, runner: &RunnerConfig) ->
     };
 
     let build_dir = git::get_build_dir(sot_path, &job.id);
+    let job_dir = git::get_job_dir(sot_path, &job.id);
+    let mut log_file = job
+        .log_file
+        .as_ref()
+        .and_then(|p| create_log_file(&job_dir, p, job.log_max_size));
 
     info!(
         target: "rollcron::job",
@@ -50,11 +55,20 @@ pub async fn execute_build(job: &Job, sot_path: &Path, runner: &RunnerConfig) ->
         "Starting build"
     );
 
+    if let Some(ref mut file) = log_file {
+        write_log_marker(file, &runner.timezone, job.timezone.as_ref(), "Build started");
+    }
+
     let result = run_build_command(job, build_config, &build_dir, sot_path, runner).await;
 
     match &result {
         BuildCommandResult::Completed(output) if output.status.success() => {
             info!(target: "rollcron::job", job_id = %job.id, "Build completed");
+            if let Some(ref mut file) = log_file {
+                let _ = file.write_all(&output.stdout);
+                let _ = file.write_all(&output.stderr);
+                write_log_marker(file, &runner.timezone, job.timezone.as_ref(), "Build finished (success)");
+            }
             BuildResult::Success
         }
         BuildCommandResult::Completed(output) => {
@@ -65,6 +79,13 @@ pub async fn execute_build(job: &Job, sot_path: &Path, runner: &RunnerConfig) ->
                 exit_code = ?output.status.code(),
                 "Build failed"
             );
+
+            if let Some(ref mut file) = log_file {
+                let _ = file.write_all(&output.stdout);
+                let _ = file.write_all(&output.stderr);
+                let marker = format!("Build finished (failed, exit code {:?})", output.status.code());
+                write_log_marker(file, &runner.timezone, job.timezone.as_ref(), &marker);
+            }
 
             // Send webhook notifications
             if !job.webhook.is_empty() {
@@ -93,6 +114,12 @@ pub async fn execute_build(job: &Job, sot_path: &Path, runner: &RunnerConfig) ->
         BuildCommandResult::ExecError(e) => {
             error!(target: "rollcron::job", job_id = %job.id, error = %e, "Build failed to execute");
 
+            if let Some(ref mut file) = log_file {
+                let _ = writeln!(file, "[rollcron] Error: {}", e);
+                let marker = format!("Build finished (error: {})", e);
+                write_log_marker(file, &runner.timezone, job.timezone.as_ref(), &marker);
+            }
+
             if !job.webhook.is_empty() {
                 let failure = BuildFailure {
                     job_id: &job.id,
@@ -118,6 +145,12 @@ pub async fn execute_build(job: &Job, sot_path: &Path, runner: &RunnerConfig) ->
         }
         BuildCommandResult::Timeout => {
             error!(target: "rollcron::job", job_id = %job.id, timeout = ?build_config.timeout, "Build timeout");
+
+            if let Some(ref mut file) = log_file {
+                let _ = writeln!(file, "[rollcron] Timeout after {:?}", build_config.timeout);
+                let marker = format!("Build finished (timeout after {:?})", build_config.timeout);
+                write_log_marker(file, &runner.timezone, job.timezone.as_ref(), &marker);
+            }
 
             if !job.webhook.is_empty() {
                 let failure = BuildFailure {
@@ -286,11 +319,12 @@ fn merge_env_vars_for_build(
 
 pub async fn execute_job(job: &Job, sot_path: &Path, runner: &RunnerConfig) -> bool {
     let run_dir = git::get_run_dir(sot_path, &job.id);
+    let job_dir = git::get_job_dir(sot_path, &job.id);
     let work_dir = resolve_work_dir(&run_dir, &job.id, &job.working_dir);
     let mut log_file = job
         .log_file
         .as_ref()
-        .and_then(|p| create_log_file(&run_dir, p, job.log_max_size));
+        .and_then(|p| create_log_file(&job_dir, p, job.log_max_size));
 
     let max_attempts = job.retry.as_ref().map(|r| r.max + 1).unwrap_or(1);
     let mut last_result: Option<CommandResult> = None;
