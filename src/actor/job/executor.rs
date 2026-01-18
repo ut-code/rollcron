@@ -31,8 +31,8 @@ pub async fn execute_job(job: &Job, sot_path: &Path, runner: &RunnerConfig) -> b
     let mut last_result: Option<CommandResult> = None;
 
     for attempt in 0..max_attempts {
-        if attempt > 0
-            && let Some(retry) = job.retry.as_ref() {
+        if attempt > 0 {
+            if let Some(retry) = job.retry.as_ref() {
                 let delay = calculate_backoff(retry, attempt - 1);
                 info!(
                     target: "rollcron::job",
@@ -44,6 +44,7 @@ pub async fn execute_job(job: &Job, sot_path: &Path, runner: &RunnerConfig) -> b
                 );
                 sleep(delay).await;
             }
+        }
 
         info!(
             target: "rollcron::job",
@@ -400,23 +401,25 @@ fn generate_jitter(max: Duration) -> Duration {
 // === Logging ===
 
 fn rotate_log_file(path: &Path, max_size: u64) {
-    if let Ok(meta) = fs::metadata(path)
-        && meta.len() >= max_size {
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.len() >= max_size {
             let old_path = path.with_extension("log.old");
             let _ = fs::remove_file(&old_path);
             let _ = fs::rename(path, &old_path);
         }
+    }
 }
 
 fn create_log_file(job_dir: &Path, log_path: &str, max_size: u64) -> Option<File> {
     let expanded = env::expand_string(log_path);
     let full_path = job_dir.join(&expanded);
 
-    if let Some(parent) = full_path.parent()
-        && let Err(e) = fs::create_dir_all(parent) {
+    if let Some(parent) = full_path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
             warn!(target: "rollcron::job", error = %e, "Failed to create log directory");
             return None;
         }
+    }
 
     rotate_log_file(&full_path, max_size);
 
