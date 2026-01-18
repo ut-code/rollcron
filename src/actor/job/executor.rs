@@ -1,3 +1,4 @@
+use chrono::{Local, Utc};
 use rand::Rng;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -8,7 +9,7 @@ use tokio::process::Command;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{Job, RetryConfig, RunnerConfig};
+use crate::config::{Job, RetryConfig, RunnerConfig, TimezoneConfig};
 use crate::env;
 use crate::git;
 use crate::webhook::{self, BuildFailure, JobFailure};
@@ -318,8 +319,17 @@ pub async fn execute_job(job: &Job, sot_path: &Path, runner: &RunnerConfig) -> b
             "Starting job"
         );
 
+        if let Some(ref mut file) = log_file {
+            let marker = if attempt > 0 {
+                format!("Job started (retry {}/{})", attempt, max_attempts - 1)
+            } else {
+                "Job started".to_string()
+            };
+            write_log_marker(file, &runner.timezone, job.timezone.as_ref(), &marker);
+        }
+
         let result = run_command(job, &work_dir, sot_path, runner).await;
-        let success = handle_result(job, &result, log_file.as_mut());
+        let success = handle_result(job, &result, log_file.as_mut(), &runner.timezone);
 
         if success {
             return true;
@@ -614,20 +624,26 @@ enum CommandResult {
     Timeout,
 }
 
-fn handle_result(job: &Job, result: &CommandResult, log_file: Option<&mut File>) -> bool {
+fn handle_result(job: &Job, result: &CommandResult, log_file: Option<&mut File>, runner_tz: &TimezoneConfig) -> bool {
     match result {
         CommandResult::Completed(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
+            let success = output.status.success();
 
             if let Some(file) = log_file {
                 let _ = file.write_all(stdout.as_bytes());
                 let _ = file.write_all(stderr.as_bytes());
+                let marker = if success {
+                    "Job finished (success)".to_string()
+                } else {
+                    format!("Job finished (failed, exit code {:?})", output.status.code())
+                };
+                write_log_marker(file, runner_tz, job.timezone.as_ref(), &marker);
             }
 
-            if output.status.success() {
+            if success {
                 info!(target: "rollcron::job", job_id = %job.id, "Completed");
-                true
             } else {
                 error!(
                     target: "rollcron::job",
@@ -635,13 +651,15 @@ fn handle_result(job: &Job, result: &CommandResult, log_file: Option<&mut File>)
                     exit_code = ?output.status.code(),
                     "Failed"
                 );
-                false
             }
+            success
         }
         CommandResult::ExecError(e) => {
             error!(target: "rollcron::job", job_id = %job.id, error = %e, "Failed to execute");
             if let Some(file) = log_file {
                 let _ = writeln!(file, "[rollcron] Error: {}", e);
+                let marker = format!("Job finished (error: {})", e);
+                write_log_marker(file, runner_tz, job.timezone.as_ref(), &marker);
             }
             false
         }
@@ -649,6 +667,8 @@ fn handle_result(job: &Job, result: &CommandResult, log_file: Option<&mut File>)
             error!(target: "rollcron::job", job_id = %job.id, timeout = ?job.timeout, "Timeout");
             if let Some(file) = log_file {
                 let _ = writeln!(file, "[rollcron] Timeout after {:?}", job.timeout);
+                let marker = format!("Job finished (timeout after {:?})", job.timeout);
+                write_log_marker(file, runner_tz, job.timezone.as_ref(), &marker);
             }
             false
         }
@@ -712,6 +732,21 @@ fn create_log_file(job_dir: &Path, log_path: &str, max_size: u64) -> Option<File
             None
         }
     }
+}
+
+fn format_timestamp(runner_tz: &TimezoneConfig, job_tz: Option<&TimezoneConfig>) -> String {
+    let fmt = "%Y-%m-%d %H:%M:%S %Z";
+    let tz = job_tz.unwrap_or(runner_tz);
+    match tz {
+        TimezoneConfig::Utc => Utc::now().format(fmt).to_string(),
+        TimezoneConfig::Inherit => Local::now().format(fmt).to_string(),
+        TimezoneConfig::Named(tz) => Utc::now().with_timezone(tz).format(fmt).to_string(),
+    }
+}
+
+fn write_log_marker(file: &mut File, runner_tz: &TimezoneConfig, job_tz: Option<&TimezoneConfig>, marker: &str) {
+    let timestamp = format_timestamp(runner_tz, job_tz);
+    let _ = writeln!(file, "\n[{timestamp}] === {marker} ===");
 }
 
 #[cfg(test)]
