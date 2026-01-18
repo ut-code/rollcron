@@ -135,8 +135,7 @@ impl JobActor {
 
                 tokio::select! {
                     _ = sleep_until(deadline) => {
-                        // Time to execute - send tick
-                        if addr.send(Tick).await.is_err() {
+                        if addr.send(Execute).await.is_err() {
                             break;
                         }
                     }
@@ -184,13 +183,13 @@ impl Actor for JobActor {
 
 // === Messages ===
 
-/// Internal tick to trigger job execution
-struct Tick;
+/// Signal from scheduler that it's time to execute the job
+struct Execute;
 
-impl Handler<Tick> for JobActor {
+impl Handler<Execute> for JobActor {
     type Return = ();
 
-    async fn handle(&mut self, _msg: Tick, _ctx: &mut Context<Self>) {
+    async fn handle(&mut self, _msg: Execute, _ctx: &mut Context<Self>) {
         if self.stopping || !self.job.enabled {
             return;
         }
