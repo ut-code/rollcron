@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::{Job, RetryConfig, RunnerConfig};
 use crate::env;
 use crate::git;
-use crate::webhook::{self, JobFailure};
+use crate::webhook::{self, BuildFailure, JobFailure};
 
 /// Default jitter ratio when not explicitly configured (25% of base delay)
 const AUTO_JITTER_RATIO: u32 = 25;
@@ -19,13 +19,258 @@ const AUTO_JITTER_RATIO: u32 = 25;
 /// Grace period to wait after SIGTERM before sending SIGKILL
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Result of a build operation.
+#[derive(Debug)]
+pub enum BuildResult {
+    Success,
+    Failed {
+        #[allow(dead_code)]
+        error: String,
+        #[allow(dead_code)]
+        stderr: String,
+    },
+    NoBuild,
+}
+
+/// Executes the build command for a job.
+/// Returns BuildResult::NoBuild if no build command is configured.
+pub async fn execute_build(job: &Job, sot_path: &Path, runner: &RunnerConfig) -> BuildResult {
+    let build_command = match &job.build {
+        Some(cmd) => cmd,
+        None => return BuildResult::NoBuild,
+    };
+
+    let build_dir = git::get_build_dir(sot_path, &job.id);
+
+    info!(
+        target: "rollcron::job",
+        job_id = %job.id,
+        command = %build_command,
+        "Starting build"
+    );
+
+    let result = run_build_command(job, build_command, &build_dir, sot_path, runner).await;
+
+    match &result {
+        BuildCommandResult::Completed(output) if output.status.success() => {
+            info!(target: "rollcron::job", job_id = %job.id, "Build completed");
+            BuildResult::Success
+        }
+        BuildCommandResult::Completed(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            error!(
+                target: "rollcron::job",
+                job_id = %job.id,
+                exit_code = ?output.status.code(),
+                "Build failed"
+            );
+
+            // Send webhook notifications
+            if !job.webhook.is_empty() {
+                let failure = BuildFailure {
+                    job_id: &job.id,
+                    job_name: &job.name,
+                    error: format!("exit code {:?}", output.status.code()),
+                    stderr: stderr.clone(),
+                };
+
+                let runner_env = load_runner_env_vars(sot_path, runner);
+                for wh in &job.webhook {
+                    let url = wh.to_url(runner_env.as_ref());
+                    if url.contains('$') || (!url.starts_with("http://") && !url.starts_with("https://")) {
+                        continue;
+                    }
+                    webhook::send_build_failure(&url, &failure).await;
+                }
+            }
+
+            BuildResult::Failed {
+                error: format!("exit code {:?}", output.status.code()),
+                stderr,
+            }
+        }
+        BuildCommandResult::ExecError(e) => {
+            error!(target: "rollcron::job", job_id = %job.id, error = %e, "Build failed to execute");
+
+            if !job.webhook.is_empty() {
+                let failure = BuildFailure {
+                    job_id: &job.id,
+                    job_name: &job.name,
+                    error: format!("exec error: {}", e),
+                    stderr: String::new(),
+                };
+
+                let runner_env = load_runner_env_vars(sot_path, runner);
+                for wh in &job.webhook {
+                    let url = wh.to_url(runner_env.as_ref());
+                    if url.contains('$') || (!url.starts_with("http://") && !url.starts_with("https://")) {
+                        continue;
+                    }
+                    webhook::send_build_failure(&url, &failure).await;
+                }
+            }
+
+            BuildResult::Failed {
+                error: format!("exec error: {}", e),
+                stderr: String::new(),
+            }
+        }
+        BuildCommandResult::Timeout => {
+            error!(target: "rollcron::job", job_id = %job.id, timeout = ?job.build_timeout, "Build timeout");
+
+            if !job.webhook.is_empty() {
+                let failure = BuildFailure {
+                    job_id: &job.id,
+                    job_name: &job.name,
+                    error: format!("timeout after {:?}", job.build_timeout),
+                    stderr: String::new(),
+                };
+
+                let runner_env = load_runner_env_vars(sot_path, runner);
+                for wh in &job.webhook {
+                    let url = wh.to_url(runner_env.as_ref());
+                    if url.contains('$') || (!url.starts_with("http://") && !url.starts_with("https://")) {
+                        continue;
+                    }
+                    webhook::send_build_failure(&url, &failure).await;
+                }
+            }
+
+            BuildResult::Failed {
+                error: format!("timeout after {:?}", job.build_timeout),
+                stderr: String::new(),
+            }
+        }
+    }
+}
+
+async fn run_build_command(
+    job: &Job,
+    command: &str,
+    build_dir: &Path,
+    sot_path: &Path,
+    runner: &RunnerConfig,
+) -> BuildCommandResult {
+    let env_vars = match merge_env_vars_for_build(job, build_dir, sot_path, runner) {
+        Ok(vars) => vars,
+        Err(e) => {
+            return BuildCommandResult::ExecError(format!("Failed to load environment: {}", e));
+        }
+    };
+
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", command])
+        .current_dir(build_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return BuildCommandResult::ExecError(e.to_string()),
+    };
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let stdout_task = tokio::spawn(async move {
+        match stdout {
+            Some(mut out) => {
+                let mut buf = Vec::new();
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf).await;
+                buf
+            }
+            None => Vec::new(),
+        }
+    });
+    let stderr_task = tokio::spawn(async move {
+        match stderr {
+            Some(mut err) => {
+                let mut buf = Vec::new();
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut buf).await;
+                buf
+            }
+            None => Vec::new(),
+        }
+    });
+
+    let wait_result = tokio::time::timeout(job.build_timeout, child.wait()).await;
+
+    match wait_result {
+        Ok(Ok(status)) => {
+            let stdout = stdout_task.await.unwrap_or_default();
+            let stderr = stderr_task.await.unwrap_or_default();
+            BuildCommandResult::Completed(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
+        }
+        Ok(Err(e)) => BuildCommandResult::ExecError(e.to_string()),
+        Err(_) => {
+            graceful_kill(&mut child, &job.id).await;
+            BuildCommandResult::Timeout
+        }
+    }
+}
+
+enum BuildCommandResult {
+    Completed(std::process::Output),
+    ExecError(String),
+    Timeout,
+}
+
+fn merge_env_vars_for_build(
+    job: &Job,
+    build_dir: &Path,
+    sot_path: &Path,
+    runner: &RunnerConfig,
+) -> anyhow::Result<HashMap<String, String>> {
+    let mut env_vars = HashMap::new();
+
+    // 1. Start with runner.env_file (loaded from sot_path)
+    if let Some(env_file_path) = &runner.env_file {
+        let expanded = env::expand_string(env_file_path);
+        let full_path = sot_path.join(&expanded);
+        let vars = env::load_env_from_path(&full_path)?;
+        env_vars.extend(vars);
+    }
+
+    // 2. Merge runner.env (with shell expansion on values)
+    if let Some(runner_env) = &runner.env {
+        for (k, v) in runner_env {
+            env_vars.insert(k.clone(), env::expand_string(v));
+        }
+    }
+
+    // 3. Merge job.env_file (loaded from build_dir)
+    if let Some(env_file_path) = &job.env_file {
+        let expanded = env::expand_string(env_file_path);
+        let full_path = build_dir.join(&expanded);
+        let vars = env::load_env_from_path(&full_path)?;
+        env_vars.extend(vars);
+    }
+
+    // 4. Merge job.env (with shell expansion on values)
+    if let Some(job_env) = &job.env {
+        for (k, v) in job_env {
+            env_vars.insert(k.clone(), env::expand_string(v));
+        }
+    }
+
+    Ok(env_vars)
+}
+
 pub async fn execute_job(job: &Job, sot_path: &Path, runner: &RunnerConfig) -> bool {
-    let job_dir = git::get_job_dir(sot_path, &job.id);
-    let work_dir = resolve_work_dir(sot_path, &job.id, &job.working_dir);
+    let run_dir = git::get_run_dir(sot_path, &job.id);
+    let work_dir = resolve_work_dir(&run_dir, &job.id, &job.working_dir);
     let mut log_file = job
         .log_file
         .as_ref()
-        .and_then(|p| create_log_file(&job_dir, p, job.log_max_size));
+        .and_then(|p| create_log_file(&run_dir, p, job.log_max_size));
 
     let max_attempts = job.retry.as_ref().map(|r| r.max + 1).unwrap_or(1);
     let mut last_result: Option<CommandResult> = None;
@@ -119,13 +364,12 @@ pub async fn execute_job(job: &Job, sot_path: &Path, runner: &RunnerConfig) -> b
     false
 }
 
-fn resolve_work_dir(sot_path: &Path, job_id: &str, working_dir: &Option<String>) -> PathBuf {
-    let job_dir = git::get_job_dir(sot_path, job_id);
+fn resolve_work_dir(run_dir: &Path, job_id: &str, working_dir: &Option<String>) -> PathBuf {
     match working_dir {
         Some(dir) => {
             let expanded = env::expand_string(dir);
-            let work_path = job_dir.join(&expanded);
-            match (work_path.canonicalize(), job_dir.canonicalize()) {
+            let work_path = run_dir.join(&expanded);
+            match (work_path.canonicalize(), run_dir.canonicalize()) {
                 (Ok(resolved), Ok(base)) if resolved.starts_with(&base) => resolved,
                 _ => {
                     warn!(
@@ -134,11 +378,11 @@ fn resolve_work_dir(sot_path: &Path, job_id: &str, working_dir: &Option<String>)
                         working_dir = %dir,
                         "Invalid working_dir: path traversal or non-existent"
                     );
-                    job_dir
+                    run_dir.to_path_buf()
                 }
             }
         }
-        None => job_dir,
+        None => run_dir.to_path_buf(),
     }
 }
 
@@ -449,6 +693,8 @@ mod tests {
             id: "test".to_string(),
             name: "Test Job".to_string(),
             schedule: Cron::from_str("* * * * *").unwrap(),
+            build: None,
+            build_timeout: Duration::from_secs(timeout_secs),
             command: cmd.to_string(),
             timeout: Duration::from_secs(timeout_secs),
             concurrency: Concurrency::Skip,

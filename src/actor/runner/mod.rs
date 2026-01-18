@@ -3,7 +3,6 @@ mod lifecycle;
 
 use crate::actor::job::{JobActor, Shutdown, SyncNeeded, Update};
 use crate::config::{self, Job, RunnerConfig};
-use crate::git;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -113,14 +112,7 @@ impl Handler<Initialize> for RunnerActor {
     async fn handle(&mut self, msg: Initialize, _ctx: &mut Context<Self>) {
         for job in msg.jobs {
             let job_id = job.id.clone();
-
-            // Initial sync
-            let job_dir = git::get_job_dir(&self.sot_path, &job_id);
-            if let Err(e) = git::sync_to_job_dir(&self.sot_path, &job_dir) {
-                error!(target: "rollcron::runner", job_id = %job_id, error = %e, "Initial sync failed, skipping job");
-                continue;
-            }
-
+            // Job actor will handle initial build/sync via pending_sync flag
             info!(target: "rollcron::runner", job_id = %job_id, "Spawning job actor");
             self.spawn_job_actor(job);
         }
@@ -173,12 +165,7 @@ impl Handler<ConfigUpdate> for RunnerActor {
                     let _ = addr.send(Update { job, runner }).await;
                 });
             } else {
-                // Create new job
-                let job_dir = git::get_job_dir(&self.sot_path, &job_id);
-                if let Err(e) = git::sync_to_job_dir(&self.sot_path, &job_dir) {
-                    error!(target: "rollcron::runner", job_id = %job_id, error = %e, "Sync failed, skipping job");
-                    continue;
-                }
+                // Create new job - job actor will handle initial build/sync
                 info!(target: "rollcron::runner", job_id = %job_id, "Spawning new job actor");
                 self.spawn_job_actor(job);
             }
@@ -296,5 +283,18 @@ impl Handler<JobFailed> for RunnerActor {
 
     async fn handle(&mut self, msg: JobFailed, _ctx: &mut Context<Self>) {
         warn!(target: "rollcron::runner", job_id = %msg.job_id, "Job failed");
+    }
+}
+
+/// Build completed for a job
+pub struct BuildCompleted {
+    pub job_id: String,
+}
+
+impl Handler<BuildCompleted> for RunnerActor {
+    type Return = ();
+
+    async fn handle(&mut self, msg: BuildCompleted, _ctx: &mut Context<Self>) {
+        info!(target: "rollcron::runner", job_id = %msg.job_id, "Build completed");
     }
 }

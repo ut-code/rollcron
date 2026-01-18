@@ -12,9 +12,23 @@ pub struct JobFailure<'a> {
     pub attempts: u32,
 }
 
+/// Information about a failed build.
+pub struct BuildFailure<'a> {
+    pub job_id: &'a str,
+    pub job_name: &'a str,
+    pub error: String,
+    pub stderr: String,
+}
+
 /// Send a Discord notification for a job failure.
 pub async fn send_job_failure(url: &str, failure: &JobFailure<'_>) {
     let payload = build_job_failure_payload(failure);
+    send_discord(url, &payload).await;
+}
+
+/// Send a Discord notification for a build failure.
+pub async fn send_build_failure(url: &str, failure: &BuildFailure<'_>) {
+    let payload = build_build_failure_payload(failure);
     send_discord(url, &payload).await;
 }
 
@@ -92,6 +106,38 @@ fn build_job_failure_payload(failure: &JobFailure<'_>) -> DiscordPayload {
         embeds: vec![DiscordEmbed {
             title: format!("[rollcron] Job '{}' failed", failure.job_name),
             color: 0xED4245, // Discord red
+            fields,
+        }],
+    }
+}
+
+fn build_build_failure_payload(failure: &BuildFailure<'_>) -> DiscordPayload {
+    let mut fields = vec![
+        DiscordField {
+            name: "Job",
+            value: format!("`{}`", failure.job_id),
+            inline: true,
+        },
+        DiscordField {
+            name: "Error",
+            value: failure.error.clone(),
+            inline: false,
+        },
+    ];
+
+    if !failure.stderr.is_empty() {
+        let truncated = truncate(&failure.stderr, 1000);
+        fields.push(DiscordField {
+            name: "Stderr",
+            value: format!("```\n{}\n```", truncated),
+            inline: false,
+        });
+    }
+
+    DiscordPayload {
+        embeds: vec![DiscordEmbed {
+            title: format!("[rollcron] Build '{}' failed", failure.job_name),
+            color: 0xFFA500, // Orange (to distinguish from job failures)
             fields,
         }],
     }

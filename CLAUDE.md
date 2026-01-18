@@ -33,11 +33,13 @@ struct Job {
     id: String,           // Key from YAML (used for directories)
     name: String,         // Display name (defaults to id)
     schedule: croner::Cron,
+    build: Option<String>,     // Optional build command (runs in build/ dir)
+    build_timeout: Duration,   // Timeout for build (defaults to timeout)
     command: String,
     timeout: Duration,
     concurrency: Concurrency,
     retry: Option<RetryConfig>,
-    log_file: Option<String>,  // Path to log file (relative to job dir)
+    log_file: Option<String>,  // Path to log file (relative to run dir)
     log_max_size: u64,         // Max log size before rotation (default: 10M)
     env_file: Option<String>,  // Path to .env file (relative to job dir)
     env: Option<HashMap<String, String>>,  // Inline env vars
@@ -86,8 +88,10 @@ jobs:
     name: "Display Name"     # Optional (defaults to job-id)
     schedule:
       cron: "*/5 * * * *"
-    run: echo hello
-    timeout: 10s             # Optional (default: 10s)
+    build: cargo build       # Optional: build command (runs in build/ directory)
+    build_timeout: 30m       # Optional: timeout for build (defaults to timeout)
+    run: ./target/debug/app  # Run command (runs in run/ directory)
+    timeout: 10s             # Optional (default: 1h)
     concurrency: skip        # Optional: parallel|wait|skip|replace (default: skip)
     retry:                   # Optional
       max: 3                 # Max retry attempts
@@ -105,13 +109,17 @@ jobs:
 
 ```
 ~/.cache/rollcron/
-├── <repo>-<random>/              # SoT: git repository (random suffix per run)
-└── <repo>-<random>@<job-id>/     # Per-job snapshot (no .git)
+├── <repo>-<random>/                    # SoT: git repository (random suffix per run)
+└── <repo>-<random>@<job-id>/
+    ├── build/                          # Git worktree for building (preserves build cache)
+    └── run/                            # Execution directory (copied from build/)
 ```
 
 **Important**:
 - Directory names use `job.id` (the YAML key), not `job.name`
 - Each run creates new directories with a random suffix (cleaned up on exit)
+- `build/` is a git worktree - gitignored files (build artifacts) are preserved between syncs
+- `run/` is copied from `build/` after successful build (excludes `.git`)
 
 ## Assumptions
 
@@ -127,24 +135,32 @@ jobs:
 1. Parse CLI args (repo, interval)
 2. Clone repo to cache via `git clone` (both local and remote)
 3. Load config from `rollcron.yaml`
-4. Sync job directories via `git archive` (using job ID)
-5. Start pull task + scheduler
+4. Start pull task + scheduler
+5. Each job actor triggers initial build/sync
 
 ### Pull Cycle (async task)
 1. `git fetch` + `git reset --hard @{upstream}`
 2. Parse config
-3. Sync all job dirs (by job ID)
+3. Notify job actors of config change (triggers build)
 4. Send new jobs to scheduler via watch channel
+
+### Build Flow (per job)
+1. Sync build/ directory via git worktree
+2. Run build command (if configured) with build_timeout
+3. On success: copy build/ to run/ (atomic, excludes .git)
+4. On failure: send webhook notification, keep old run/
 
 ### Job Execution
 1. Each job calculates next occurrence and sleeps until scheduled time
-2. When scheduled time arrives: spawn task in job's directory (by ID) with timeout
+2. When scheduled time arrives: spawn task in run/ directory with timeout
 3. On failure: apply exponential backoff + retry jitter before retry
+4. After job completes: try to copy pending build if any
 
 ### Shutdown (Ctrl+C)
-1. Wait for running jobs to complete (graceful stop)
-2. Stop all job actors
-3. Remove all cache directories (sot_path + job dirs)
+1. Wait for running builds to complete
+2. Wait for running jobs to complete (graceful stop)
+3. Stop all job actors
+4. Remove all cache directories (worktrees + job dirs)
 
 ## Logging
 
@@ -169,6 +185,7 @@ jobs:
 
 Webhooks send Discord notifications for:
 - **Job failures** (after all retries exhausted)
+- **Build failures** (when build command fails)
 - **Config parse errors** (runner-level webhooks only)
 
 ```yaml
@@ -182,9 +199,10 @@ runner:
 
 **Payloads**:
 - Job failure: Discord embed (red) with Job, Attempts, Error, Stderr fields
+- Build failure: Discord embed (orange) with Job, Error, Stderr fields
 - Config error: Discord embed (orange) with Error field
 
-**Inheritance**: Job webhooks extend runner webhooks (both are notified on job failure).
+**Inheritance**: Job webhooks extend runner webhooks (both are notified on job/build failure).
 
 ## Environment Variables
 
@@ -232,8 +250,9 @@ cargo run -- . -i 10         # Test with local repo
 4. Add test case
 
 ### Change sync mechanism
-- Edit `sync_to_job_dir()` in `git.rs`
-- Currently: `git archive HEAD | tar -x`
+- Edit `sync_to_build_dir()` and `copy_build_to_run()` in `git.rs`
+- Build sync: `git worktree add/reset` (preserves gitignored files)
+- Run copy: `tar --exclude=.git -c | tar -x` (atomic swap)
 
 ### Add CLI flag
 1. Add field to `Args` struct in `main.rs`

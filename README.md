@@ -76,8 +76,10 @@ jobs:
     name: "Display Name"      # Optional: display name (defaults to job ID)
     schedule:
       cron: "* * * * *"       # Cron expression (5 fields)
-    run: command              # Shell command
-    timeout: 10s              # Optional (default: 10s)
+    build: make               # Optional: build command (runs in build/ dir, preserves cache)
+    build_timeout: 30m        # Optional: timeout for build (defaults to timeout)
+    run: ./app                # Shell command (runs in run/ dir)
+    timeout: 10s              # Optional (default: 1h)
     jitter: 30s               # Optional: random delay 0-30s before execution
     concurrency: skip         # Optional: parallel|wait|skip|replace (default: skip)
     working_dir: ./subdir     # Optional: working directory (relative to job snapshot dir)
@@ -204,6 +206,32 @@ retry:
   jitter: 500ms # Optional: random variation (default: 25% of delay)
 ```
 
+### Build Step
+
+Jobs can optionally include a build step that runs before execution. Build artifacts are cached between syncs:
+
+```yaml
+jobs:
+  my-app:
+    build: cargo build --release    # Runs in build/ directory
+    build_timeout: 30m              # Optional (defaults to timeout)
+    run: ./target/release/app       # Runs in run/ directory
+    timeout: 10s
+    schedule:
+      cron: "0 * * * *"
+```
+
+**Key features**:
+- Build runs in a git worktree (`build/`), so `.gitignore`d files (like `target/`, `node_modules/`) are preserved
+- After successful build, the result is atomically copied to `run/` for execution
+- If build fails, the previous `run/` directory is kept (jobs continue running old version)
+- Build failures send webhook notifications (if configured)
+
+**When to use**:
+- Compiled languages (Rust, Go, C++)
+- Projects with npm/yarn build steps
+- Any job that benefits from cached build artifacts
+
 ### Logging
 
 Capture job output to a file:
@@ -249,17 +277,26 @@ Examples:
 
 1. Clones/pulls your repository periodically
 2. Reads `rollcron.yaml` for job definitions
-3. Creates isolated working directories per job
-4. Executes jobs according to their schedules
+3. Creates isolated build/run directories per job
+4. Runs build commands (if configured) with cache preservation
+5. Copies build artifacts to run directory
+6. Executes jobs according to their schedules
 
 ```
 ~/.cache/rollcron/
-├── repo-abc123/           # Source of truth (git repo)
-├── repo-abc123@hello/     # Job "hello" working dir
-└── repo-abc123@backup/    # Job "backup" working dir
+├── repo-abc123/              # Source of truth (git repo)
+└── repo-abc123@hello/
+    ├── build/                # Git worktree (build cache preserved)
+    └── run/                  # Execution directory (copied from build/)
 ```
 
-Jobs run in their own snapshot directories, so git pulls don't interfere with running jobs.
+**Build workflow**:
+- `build/` is a git worktree - gitignored files (build artifacts) are preserved between git syncs
+- After successful build, `build/` is atomically copied to `run/` (excluding `.git`)
+- Jobs execute in `run/`, which stays stable during builds
+- If build fails, the previous `run/` directory is kept
+
+Jobs run in their own snapshot directories, so git pulls and builds don't interfere with running jobs.
 
 ## CLI Reference
 
@@ -282,16 +319,28 @@ runner:
   env_file: .env
   env:
     NODE_ENV: production
+  webhook:
+    - url: $DISCORD_WEBHOOK_URL
 
 jobs:
+  build-and-run:
+    name: "Build & Run App"
+    schedule:
+      cron: "0 * * * *"
+    build: cargo build --release    # Cached between syncs
+    build_timeout: 30m
+    run: ./target/release/my-app
+    timeout: 5m
+
   test:
     name: "Run Tests"
     schedule:
       cron: "0 */6 * * *"
+    build: npm ci                   # Install dependencies
     run: npm test
     working_dir: ./frontend
     env:
-      NODE_ENV: test       # Override for testing
+      NODE_ENV: test
     retry:
       max: 2
       delay: 30s

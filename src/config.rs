@@ -114,6 +114,8 @@ struct Config {
 pub struct JobConfig {
     pub name: Option<String>,
     pub schedule: ScheduleConfig,
+    pub build: Option<String>,
+    pub build_timeout: Option<String>,
     pub run: String,
     #[serde(default = "default_timeout")]
     pub timeout: String,
@@ -163,6 +165,8 @@ pub struct Job {
     pub id: String,
     pub name: String,
     pub schedule: Cron,
+    pub build: Option<String>,
+    pub build_timeout: Duration,
     pub command: String,
     pub timeout: Duration,
     pub concurrency: Concurrency,
@@ -238,6 +242,12 @@ fn parse_job(
     let timeout = parse_duration(&job.timeout)
         .map_err(|e| anyhow!("Invalid timeout '{}': {}", job.timeout, e))?;
 
+    let build_timeout = job
+        .build_timeout
+        .map(|bt| parse_duration(&bt).map_err(|e| anyhow!("Invalid build_timeout '{}': {}", bt, e)))
+        .transpose()?
+        .unwrap_or(timeout);
+
     let name = job.name.unwrap_or_else(|| id.to_string());
 
     let retry = job
@@ -288,6 +298,8 @@ fn parse_job(
         id: id.to_string(),
         name,
         schedule,
+        build: job.build,
+        build_timeout,
         command: job.run,
         timeout,
         concurrency: job.concurrency,
@@ -1010,5 +1022,67 @@ jobs:
 
         // Undefined vars are kept as-is (caller should validate)
         assert_eq!(webhook.to_url(Some(&env_vars)), "$UNDEFINED_VAR");
+    }
+
+    #[test]
+    fn parse_build_command() {
+        let yaml = r#"
+jobs:
+  build-job:
+    build: cargo build --release
+    schedule:
+      cron: "0 * * * *"
+    run: ./target/release/app
+"#;
+        let (_, jobs) = parse_config(yaml).unwrap();
+        assert_eq!(jobs[0].build, Some("cargo build --release".to_string()));
+        assert_eq!(jobs[0].command, "./target/release/app");
+    }
+
+    #[test]
+    fn parse_build_timeout() {
+        let yaml = r#"
+jobs:
+  build-job:
+    build: cargo build --release
+    build_timeout: 30m
+    timeout: 10s
+    schedule:
+      cron: "0 * * * *"
+    run: ./target/release/app
+"#;
+        let (_, jobs) = parse_config(yaml).unwrap();
+        assert_eq!(jobs[0].build_timeout, Duration::from_secs(30 * 60));
+        assert_eq!(jobs[0].timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn parse_build_timeout_defaults_to_timeout() {
+        let yaml = r#"
+jobs:
+  build-job:
+    build: cargo build --release
+    timeout: 5m
+    schedule:
+      cron: "0 * * * *"
+    run: ./target/release/app
+"#;
+        let (_, jobs) = parse_config(yaml).unwrap();
+        // build_timeout should default to timeout when not specified
+        assert_eq!(jobs[0].build_timeout, Duration::from_secs(5 * 60));
+        assert_eq!(jobs[0].timeout, Duration::from_secs(5 * 60));
+    }
+
+    #[test]
+    fn parse_no_build_command() {
+        let yaml = r#"
+jobs:
+  simple-job:
+    schedule:
+      cron: "0 * * * *"
+    run: echo hello
+"#;
+        let (_, jobs) = parse_config(yaml).unwrap();
+        assert!(jobs[0].build.is_none());
     }
 }

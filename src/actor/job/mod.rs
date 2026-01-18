@@ -1,7 +1,7 @@
 mod executor;
 mod tick;
 
-use crate::actor::runner::{JobCompleted, JobFailed, RunnerActor};
+use crate::actor::runner::{BuildCompleted as RunnerBuildCompleted, JobCompleted, JobFailed, RunnerActor};
 use crate::config::{Concurrency, Job, RunnerConfig};
 use crate::git;
 use chrono::Utc;
@@ -9,11 +9,11 @@ use std::path::PathBuf;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, Instant};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use xtra::prelude::*;
 use xtra::refcount::Weak;
 
-use executor::execute_job;
+use executor::{execute_build, execute_job, BuildResult};
 use tick::next_occurrence;
 
 /// Job Actor - manages a single job's lifecycle
@@ -22,11 +22,17 @@ pub struct JobActor {
     sot_path: PathBuf,
     runner: RunnerConfig,
     runner_addr: Option<Address<RunnerActor, Weak>>,
+    self_addr: Option<Address<Self, Weak>>,
     pending_sync: bool,
     handles: Vec<JoinHandle<()>>,
     scheduler_handle: Option<JoinHandle<()>>,
     config_tx: watch::Sender<(Job, RunnerConfig)>,
     stopping: bool,
+    // Build state
+    build_in_progress: bool,
+    build_handle: Option<JoinHandle<()>>,
+    pending_copy: bool, // build done, waiting for execution to finish
+    run_dir_ready: bool, // run/ directory exists and is ready for execution
 }
 
 impl JobActor {
@@ -42,20 +48,27 @@ impl JobActor {
             sot_path,
             runner,
             runner_addr,
+            self_addr: None,
             pending_sync: true, // Initial sync needed
             handles: Vec::new(),
             scheduler_handle: None,
             config_tx,
             stopping: false,
+            build_in_progress: false,
+            build_handle: None,
+            pending_copy: false,
+            run_dir_ready: false,
         }
     }
 
-    fn try_sync(&mut self) -> anyhow::Result<bool> {
-        if self.pending_sync {
-            info!(target: "rollcron::job", job_id = %self.job.id, "Syncing directory");
-            let job_dir = git::get_job_dir(&self.sot_path, &self.job.id);
-            git::sync_to_job_dir(&self.sot_path, &job_dir)?;
-            self.pending_sync = false;
+    fn try_copy(&mut self) -> anyhow::Result<bool> {
+        if self.pending_copy && self.running_count() == 0 {
+            info!(target: "rollcron::job", job_id = %self.job.id, "Copying build to run directory");
+            let build_dir = git::get_build_dir(&self.sot_path, &self.job.id);
+            let run_dir = git::get_run_dir(&self.sot_path, &self.job.id);
+            git::copy_build_to_run(&build_dir, &run_dir)?;
+            self.pending_copy = false;
+            self.run_dir_ready = true;
             Ok(true)
         } else {
             Ok(false)
@@ -145,13 +158,18 @@ impl Actor for JobActor {
     type Stop = ();
 
     async fn started(&mut self, mailbox: &Mailbox<Self>) -> Result<(), Self::Stop> {
-        self.start_scheduler(mailbox.address());
+        let addr = mailbox.address();
+        self.self_addr = Some(addr.clone());
+        self.start_scheduler(addr);
         info!(target: "rollcron::job", job_id = %self.job.id, "Job actor started");
         Ok(())
     }
 
     async fn stopped(mut self) -> Self::Stop {
         if let Some(handle) = self.scheduler_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.build_handle.take() {
             handle.abort();
         }
         for handle in self.handles.drain(..) {
@@ -174,15 +192,28 @@ impl Handler<Tick> for JobActor {
             return;
         }
 
+        let Some(addr) = self.self_addr.clone() else {
+            return;
+        };
+
         info!(target: "rollcron::job", job_id = %self.job.id, "Job triggered");
 
-        // Sync if needed
-        if let Err(e) = self.try_sync() {
-            error!(target: "rollcron::job", job_id = %self.job.id, error = %e, "Sync failed");
+        // Trigger build/sync if pending
+        if self.pending_sync && !self.build_in_progress {
+            self.start_build(addr.clone());
+        }
+
+        // Check if run directory is ready
+        if !self.run_dir_ready {
+            warn!(
+                target: "rollcron::job",
+                job_id = %self.job.id,
+                "Skipped: run directory not ready (build in progress or first run)"
+            );
             return;
         }
 
-        self.handle_trigger().await;
+        self.handle_trigger(addr).await;
     }
 }
 
@@ -203,7 +234,7 @@ impl Handler<Update> for JobActor {
     }
 }
 
-/// Mark job as needing sync
+/// Mark job as needing sync (triggers build on next opportunity)
 pub struct SyncNeeded {
     pub sot_path: PathBuf,
 }
@@ -214,6 +245,64 @@ impl Handler<SyncNeeded> for JobActor {
     async fn handle(&mut self, msg: SyncNeeded, _ctx: &mut Context<Self>) {
         self.sot_path = msg.sot_path;
         self.pending_sync = true;
+
+        // Start build immediately if not already in progress
+        if !self.build_in_progress {
+            if let Some(addr) = self.self_addr.clone() {
+                self.start_build(addr);
+            }
+        }
+    }
+}
+
+/// Internal message: build completed
+struct BuildCompleted {
+    success: bool,
+}
+
+impl Handler<BuildCompleted> for JobActor {
+    type Return = ();
+
+    async fn handle(&mut self, msg: BuildCompleted, _ctx: &mut Context<Self>) {
+        self.build_in_progress = false;
+        self.build_handle = None;
+
+        if msg.success {
+            info!(target: "rollcron::job", job_id = %self.job.id, "Build succeeded, scheduling copy");
+            self.pending_copy = true;
+
+            // Try to copy immediately if no jobs running
+            if let Err(e) = self.try_copy() {
+                error!(target: "rollcron::job", job_id = %self.job.id, error = %e, "Copy failed");
+            }
+
+            // Notify runner
+            if let Some(addr) = &self.runner_addr {
+                let _ = addr.send(RunnerBuildCompleted { job_id: self.job.id.clone() }).await;
+            }
+        } else {
+            warn!(target: "rollcron::job", job_id = %self.job.id, "Build failed, keeping old run directory");
+        }
+
+        // If there's another pending sync (config changed during build), start another build
+        if self.pending_sync && !self.build_in_progress {
+            if let Some(addr) = self.self_addr.clone() {
+                self.start_build(addr);
+            }
+        }
+    }
+}
+
+/// Internal message: try to copy build to run
+struct TryCopy;
+
+impl Handler<TryCopy> for JobActor {
+    type Return = ();
+
+    async fn handle(&mut self, _msg: TryCopy, _ctx: &mut Context<Self>) {
+        if let Err(e) = self.try_copy() {
+            error!(target: "rollcron::job", job_id = %self.job.id, error = %e, "Copy failed");
+        }
     }
 }
 
@@ -229,7 +318,7 @@ impl Handler<Shutdown> for JobActor {
     }
 }
 
-/// Graceful stop - wait for current execution
+/// Graceful stop - wait for current execution and build
 pub struct GracefulStop;
 
 impl Handler<GracefulStop> for JobActor {
@@ -237,6 +326,12 @@ impl Handler<GracefulStop> for JobActor {
 
     async fn handle(&mut self, _msg: GracefulStop, ctx: &mut Context<Self>) {
         self.stopping = true;
+
+        // Wait for build if in progress
+        if let Some(handle) = self.build_handle.take() {
+            let _ = handle.await;
+        }
+
         // Wait for running tasks
         for handle in self.handles.drain(..) {
             let _ = handle.await;
@@ -248,13 +343,51 @@ impl Handler<GracefulStop> for JobActor {
 // === Job Execution Logic ===
 
 impl JobActor {
-    async fn handle_trigger(&mut self) {
+    fn start_build(&mut self, addr: Address<Self, Weak>) {
+        if self.build_in_progress {
+            return;
+        }
+
+        self.build_in_progress = true;
+        self.pending_sync = false;
+
+        let job = self.job.clone();
+        let sot_path = self.sot_path.clone();
+        let runner = self.runner.clone();
+
+        info!(target: "rollcron::job", job_id = %job.id, "Starting build process");
+
+        let handle = tokio::spawn(async move {
+            // Step 1: Sync build directory
+            let build_dir = git::get_build_dir(&sot_path, &job.id);
+            if let Err(e) = git::sync_to_build_dir(&sot_path, &build_dir) {
+                error!(target: "rollcron::job", job_id = %job.id, error = %e, "Build sync failed");
+                let _ = addr.send(BuildCompleted { success: false }).await;
+                return;
+            }
+
+            // Step 2: Run build command (if configured)
+            let result = execute_build(&job, &sot_path, &runner).await;
+
+            let success = match result {
+                BuildResult::Success => true,
+                BuildResult::NoBuild => true, // No build command, treat as success
+                BuildResult::Failed { .. } => false,
+            };
+
+            let _ = addr.send(BuildCompleted { success }).await;
+        });
+
+        self.build_handle = Some(handle);
+    }
+
+    async fn handle_trigger(&mut self, addr: Address<Self, Weak>) {
         self.cleanup_finished_handles();
         let running_count = self.running_count();
 
         match self.job.concurrency {
             Concurrency::Parallel => {
-                self.spawn_job();
+                self.spawn_job(addr);
             }
             Concurrency::Wait => {
                 if running_count > 0 {
@@ -264,9 +397,9 @@ impl JobActor {
                         running_count,
                         "Waiting for previous run(s) to complete"
                     );
-                    self.spawn_waiting_job();
+                    self.spawn_waiting_job(addr);
                 } else {
-                    self.spawn_job();
+                    self.spawn_job(addr);
                 }
             }
             Concurrency::Skip => {
@@ -278,7 +411,7 @@ impl JobActor {
                         "Skipped (instances still active)"
                     );
                 } else {
-                    self.spawn_job();
+                    self.spawn_job(addr);
                 }
             }
             Concurrency::Replace => {
@@ -293,12 +426,12 @@ impl JobActor {
                         handle.abort();
                     }
                 }
-                self.spawn_job();
+                self.spawn_job(addr);
             }
         }
     }
 
-    fn spawn_job(&mut self) {
+    fn spawn_job(&mut self, self_addr: Address<Self, Weak>) {
         let job_id = self.job.id.clone();
         let job = self.job.clone();
         let sot_path = self.sot_path.clone();
@@ -307,6 +440,8 @@ impl JobActor {
 
         let handle = tokio::spawn(async move {
             let success = execute_job(&job, &sot_path, &runner).await;
+
+            // Notify runner
             if let Some(addr) = runner_addr {
                 let msg = if success {
                     Either::Left(JobCompleted { job_id })
@@ -318,12 +453,15 @@ impl JobActor {
                     Either::Right(m) => { let _ = addr.send(m).await; }
                 }
             }
+
+            // Try to copy pending build (if any)
+            let _ = self_addr.send(TryCopy).await;
         });
 
         self.handles.push(handle);
     }
 
-    fn spawn_waiting_job(&mut self) {
+    fn spawn_waiting_job(&mut self, self_addr: Address<Self, Weak>) {
         let job_id = self.job.id.clone();
         let job = self.job.clone();
         let sot_path = self.sot_path.clone();
@@ -336,6 +474,8 @@ impl JobActor {
                 let _ = prev_handle.await;
             }
             let success = execute_job(&job, &sot_path, &runner).await;
+
+            // Notify runner
             if let Some(addr) = runner_addr {
                 let msg = if success {
                     Either::Left(JobCompleted { job_id })
@@ -347,6 +487,9 @@ impl JobActor {
                     Either::Right(m) => { let _ = addr.send(m).await; }
                 }
             }
+
+            // Try to copy pending build (if any)
+            let _ = self_addr.send(TryCopy).await;
         });
 
         self.handles.push(handle);
