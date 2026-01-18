@@ -31,8 +31,8 @@ pub struct JobActor {
     // Build state
     build_in_progress: bool,
     build_handle: Option<JoinHandle<()>>,
-    pending_copy: bool, // build done, waiting for execution to finish
-    run_dir_ready: bool, // run/ directory exists and is ready for execution
+    pending_copy: bool,  // build done, waiting for execution to finish
+    pending_run: bool,   // tick arrived during first build, run after build completes
 }
 
 impl JobActor {
@@ -57,7 +57,7 @@ impl JobActor {
             build_in_progress: false,
             build_handle: None,
             pending_copy: false,
-            run_dir_ready: false,
+            pending_run: false,
         }
     }
 
@@ -68,11 +68,14 @@ impl JobActor {
             let run_dir = git::get_run_dir(&self.sot_path, &self.job.id);
             git::copy_build_to_run(&build_dir, &run_dir)?;
             self.pending_copy = false;
-            self.run_dir_ready = true;
             Ok(true)
         } else {
             Ok(false)
         }
+    }
+
+    fn run_dir_exists(&self) -> bool {
+        git::get_run_dir(&self.sot_path, &self.job.id).exists()
     }
 
     fn cleanup_finished_handles(&mut self) {
@@ -203,13 +206,23 @@ impl Handler<Tick> for JobActor {
             self.start_build(addr.clone());
         }
 
-        // Check if run directory is ready
-        if !self.run_dir_ready {
-            warn!(
-                target: "rollcron::job",
-                job_id = %self.job.id,
-                "Skipped: run directory not ready (build in progress or first run)"
-            );
+        // Check if run directory exists
+        if !self.run_dir_exists() {
+            // First run: wait for build to complete, then run
+            if self.build_in_progress {
+                info!(
+                    target: "rollcron::job",
+                    job_id = %self.job.id,
+                    "Waiting for initial build to complete"
+                );
+                self.pending_run = true;
+            } else {
+                warn!(
+                    target: "rollcron::job",
+                    job_id = %self.job.id,
+                    "Skipped: run directory not ready and no build in progress"
+                );
+            }
             return;
         }
 
@@ -280,8 +293,17 @@ impl Handler<BuildCompleted> for JobActor {
             if let Some(addr) = &self.runner_addr {
                 let _ = addr.send(RunnerBuildCompleted { job_id: self.job.id.clone() }).await;
             }
+
+            // Run job if it was waiting for this build
+            if self.pending_run {
+                self.pending_run = false;
+                if let Some(addr) = self.self_addr.clone() {
+                    self.handle_trigger(addr).await;
+                }
+            }
         } else {
             warn!(target: "rollcron::job", job_id = %self.job.id, "Build failed, keeping old run directory");
+            self.pending_run = false;
         }
 
         // If there's another pending sync (config changed during build), start another build
