@@ -161,6 +161,24 @@ mod tests {
     }
 
     #[test]
+    fn english_12am_is_midnight() {
+        let schedule = parse_schedule("every day at 12:00 am");
+        let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        // 12 am = midnight = 00:00, so next occurrence is next day
+        assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 16, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn english_12pm_is_noon() {
+        let schedule = parse_schedule("every day at 12:00 pm");
+        let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        // 12 pm = noon = 12:00
+        assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap());
+    }
+
+    #[test]
     fn english_7pm_every_thursday() {
         let schedule = parse_schedule("7pm every Thursday");
         // 2025-01-15 is Wednesday
