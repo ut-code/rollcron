@@ -1,6 +1,5 @@
 use crate::config::{Job, RunnerConfig, TimezoneConfig};
 use chrono::{DateTime, Local, TimeZone, Utc};
-use chrono_tz::Tz;
 use croner::Cron;
 
 /// Returns the next scheduled time for a job, or None if no future occurrence.
@@ -20,11 +19,6 @@ pub fn next_occurrence_from(
         TimezoneConfig::Inherit => find_next_from(&job.schedule, Local, now),
         TimezoneConfig::Named(tz) => find_next_from(&job.schedule, *tz, now),
     }
-}
-
-/// Pure function: calculates next occurrence for a cron schedule in a given timezone.
-pub fn schedule_next_from(schedule: &Cron, tz: Tz, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    find_next_from(schedule, tz, now)
 }
 
 fn find_next_from<Z: TimeZone>(
@@ -67,7 +61,7 @@ mod tests {
         let schedule = parse_schedule("* * * * *");
         // 2025-01-15 10:30:00 UTC
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 30, 0).unwrap();
-        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        let next = find_next_from(&schedule, UTC, now).unwrap();
         // Should be 10:31:00
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 15, 10, 31, 0).unwrap());
     }
@@ -77,7 +71,7 @@ mod tests {
         let schedule = parse_schedule("*/5 * * * *");
         // 2025-01-15 10:32:00 UTC
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 32, 0).unwrap();
-        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        let next = find_next_from(&schedule, UTC, now).unwrap();
         // Should be 10:35:00
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 15, 10, 35, 0).unwrap());
     }
@@ -87,7 +81,7 @@ mod tests {
         let schedule = parse_schedule("0 8 * * *");
         // 2025-01-15 10:00:00 UTC (already past 8am)
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
-        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        let next = find_next_from(&schedule, UTC, now).unwrap();
         // Should be next day 8:00:00
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 16, 8, 0, 0).unwrap());
     }
@@ -97,7 +91,7 @@ mod tests {
         let schedule = parse_schedule("0 8 * * *");
         // 2025-01-15 05:00:00 UTC (before 8am)
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 5, 0, 0).unwrap();
-        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        let next = find_next_from(&schedule, UTC, now).unwrap();
         // Should be same day 8:00:00
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 15, 8, 0, 0).unwrap());
     }
@@ -111,7 +105,7 @@ mod tests {
         let schedule = parse_schedule("every 5 minutes");
         // 2025-01-15 10:32:00 UTC
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 32, 0).unwrap();
-        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        let next = find_next_from(&schedule, UTC, now).unwrap();
         // Should be 10:35:00
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 15, 10, 35, 0).unwrap());
     }
@@ -120,7 +114,7 @@ mod tests {
     fn english_every_minute() {
         let schedule = parse_schedule("every minute");
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 30, 0).unwrap();
-        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        let next = find_next_from(&schedule, UTC, now).unwrap();
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 15, 10, 31, 0).unwrap());
     }
 
@@ -128,7 +122,7 @@ mod tests {
     fn english_every_hour() {
         let schedule = parse_schedule("every hour");
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 30, 0).unwrap();
-        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        let next = find_next_from(&schedule, UTC, now).unwrap();
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap());
     }
 
@@ -137,7 +131,7 @@ mod tests {
         let schedule = parse_schedule("every day at 4:00 pm");
         // 2025-01-15 10:00:00 UTC (before 4pm)
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
-        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        let next = find_next_from(&schedule, UTC, now).unwrap();
         // Should be same day 16:00:00
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 15, 16, 0, 0).unwrap());
     }
@@ -147,7 +141,7 @@ mod tests {
         let schedule = parse_schedule("every day at 4:00 pm");
         // 2025-01-15 18:00:00 UTC (after 4pm)
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 18, 0, 0).unwrap();
-        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        let next = find_next_from(&schedule, UTC, now).unwrap();
         // Should be next day 16:00:00
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 16, 16, 0, 0).unwrap());
     }
@@ -156,7 +150,7 @@ mod tests {
     fn english_at_10am() {
         let schedule = parse_schedule("at 10:00 am");
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 8, 0, 0).unwrap();
-        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        let next = find_next_from(&schedule, UTC, now).unwrap();
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap());
     }
 
@@ -164,7 +158,7 @@ mod tests {
     fn english_12am_is_midnight() {
         let schedule = parse_schedule("every day at 12:00 am");
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
-        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        let next = find_next_from(&schedule, UTC, now).unwrap();
         // 12 am = midnight = 00:00, so next occurrence is next day
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 16, 0, 0, 0).unwrap());
     }
@@ -173,7 +167,7 @@ mod tests {
     fn english_12pm_is_noon() {
         let schedule = parse_schedule("every day at 12:00 pm");
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
-        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        let next = find_next_from(&schedule, UTC, now).unwrap();
         // 12 pm = noon = 12:00
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap());
     }
@@ -182,7 +176,7 @@ mod tests {
     fn english_24h_format() {
         let schedule = parse_schedule("every day at 16:00");
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
-        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        let next = find_next_from(&schedule, UTC, now).unwrap();
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 15, 16, 0, 0).unwrap());
     }
 
@@ -215,7 +209,7 @@ mod tests {
         let schedule = parse_schedule("7pm every Thursday");
         // 2025-01-15 is Wednesday
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
-        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        let next = find_next_from(&schedule, UTC, now).unwrap();
         // Next Thursday is 2025-01-16 at 19:00
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 16, 19, 0, 0).unwrap());
     }
@@ -225,7 +219,7 @@ mod tests {
         let schedule = parse_schedule("Sunday at 12:00");
         // 2025-01-15 is Wednesday
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
-        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        let next = find_next_from(&schedule, UTC, now).unwrap();
         // Next Sunday is 2025-01-19 at 12:00
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 19, 12, 0, 0).unwrap());
     }
@@ -239,7 +233,7 @@ mod tests {
         let schedule = parse_schedule("0 8 * * *");
         // 2025-01-15 00:00:00 UTC = 2025-01-15 09:00:00 Tokyo (past 8am Tokyo)
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 0, 0, 0).unwrap();
-        let next = schedule_next_from(&schedule, Tokyo, now).unwrap();
+        let next = find_next_from(&schedule, Tokyo, now).unwrap();
         // Next 8am Tokyo = 2025-01-15 23:00:00 UTC (8am - 9h offset)
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 15, 23, 0, 0).unwrap());
     }
@@ -249,7 +243,7 @@ mod tests {
         let schedule = parse_schedule("0 8 * * *");
         // 2025-01-14 20:00:00 UTC = 2025-01-15 05:00:00 Tokyo (before 8am Tokyo)
         let now = Utc.with_ymd_and_hms(2025, 1, 14, 20, 0, 0).unwrap();
-        let next = schedule_next_from(&schedule, Tokyo, now).unwrap();
+        let next = find_next_from(&schedule, Tokyo, now).unwrap();
         // Same day 8am Tokyo = 2025-01-14 23:00:00 UTC
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 14, 23, 0, 0).unwrap());
     }
@@ -259,7 +253,7 @@ mod tests {
         let schedule = parse_schedule("0 9 * * *");
         // 2025-01-15 10:00:00 UTC = 2025-01-15 05:00:00 New York (EST, UTC-5)
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
-        let next = schedule_next_from(&schedule, New_York, now).unwrap();
+        let next = find_next_from(&schedule, New_York, now).unwrap();
         // 9am New York = 14:00:00 UTC
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 15, 14, 0, 0).unwrap());
     }
@@ -269,7 +263,7 @@ mod tests {
         let schedule = parse_schedule("0 0 * * *");
         // 2025-01-15 01:00:00 UTC = 2025-01-15 01:00:00 London (GMT, same as UTC in winter)
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 1, 0, 0).unwrap();
-        let next = schedule_next_from(&schedule, London, now).unwrap();
+        let next = find_next_from(&schedule, London, now).unwrap();
         // Next midnight London = 2025-01-16 00:00:00 UTC
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 16, 0, 0, 0).unwrap());
     }
@@ -279,9 +273,9 @@ mod tests {
         let schedule = parse_schedule("0 12 * * *"); // noon
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 0, 0, 0).unwrap();
 
-        let next_utc = schedule_next_from(&schedule, UTC, now).unwrap();
-        let next_tokyo = schedule_next_from(&schedule, Tokyo, now).unwrap();
-        let next_ny = schedule_next_from(&schedule, New_York, now).unwrap();
+        let next_utc = find_next_from(&schedule, UTC, now).unwrap();
+        let next_tokyo = find_next_from(&schedule, Tokyo, now).unwrap();
+        let next_ny = find_next_from(&schedule, New_York, now).unwrap();
 
         // Noon UTC = 12:00 UTC
         assert_eq!(next_utc, Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap());
@@ -387,7 +381,7 @@ jobs:
         let schedule = parse_schedule("0 12 * * *");
         // Exactly at noon
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
-        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        let next = find_next_from(&schedule, UTC, now).unwrap();
         // Should return next day's noon (not the same time)
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 16, 12, 0, 0).unwrap());
     }
@@ -396,7 +390,7 @@ jobs:
     fn year_boundary() {
         let schedule = parse_schedule("0 0 1 1 *"); // Jan 1st midnight
         let now = Utc.with_ymd_and_hms(2025, 12, 31, 23, 0, 0).unwrap();
-        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        let next = find_next_from(&schedule, UTC, now).unwrap();
         assert_eq!(next, Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap());
     }
 
@@ -404,7 +398,7 @@ jobs:
     fn month_boundary() {
         let schedule = parse_schedule("0 0 1 * *"); // 1st of every month
         let now = Utc.with_ymd_and_hms(2025, 1, 31, 12, 0, 0).unwrap();
-        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        let next = find_next_from(&schedule, UTC, now).unwrap();
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 2, 1, 0, 0, 0).unwrap());
     }
 
@@ -413,7 +407,7 @@ jobs:
         let schedule = parse_schedule("0 7 * * 0"); // Sunday 7am
         // 2025-01-15 is Wednesday
         let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
-        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        let next = find_next_from(&schedule, UTC, now).unwrap();
         // Next Sunday is 2025-01-19
         assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 19, 7, 0, 0).unwrap());
     }
