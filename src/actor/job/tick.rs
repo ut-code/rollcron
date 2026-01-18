@@ -179,6 +179,14 @@ mod tests {
     }
 
     #[test]
+    fn english_24h_format() {
+        let schedule = parse_schedule("every day at 16:00");
+        let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+        let next = schedule_next_from(&schedule, UTC, now).unwrap();
+        assert_eq!(next, Utc.with_ymd_and_hms(2025, 1, 15, 16, 0, 0).unwrap());
+    }
+
+    #[test]
     fn english_7pm_every_thursday() {
         let schedule = parse_schedule("7pm every Thursday");
         // 2025-01-15 is Wednesday

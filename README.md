@@ -266,9 +266,16 @@ Full form:
 **Size**: `512K`, `10M`, `1G`, or bytes
 
 **Schedule**: Cron or English phrase
+
 - Cron: `min hour day month weekday` (e.g., `*/5 * * * *` = every 5 minutes)
-- English: `every 5 minutes`, `every day at 4:00 pm`, `7pm every Thursday`, `Sunday at 12:00`, `midnight on Tuesdays`
-- Note: `12 am` = midnight (00:00), `12 pm` = noon (12:00)
+- English examples:
+  - `every 5 minutes`
+  - `every day at 16:00`
+  - `7pm every Thursday`
+  - `Sunday at 12:00`
+  - `midnight on Tuesdays`
+- 24-hour format preferred
+- 12-hour edge case: `12 am` = midnight (00:00), `12 pm` = noon (12:00)
 
 ### Environment variable priority
 
