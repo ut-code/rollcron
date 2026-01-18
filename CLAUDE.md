@@ -34,6 +34,7 @@ struct BuildConfigRaw {
     timeout: Option<String>,
     env_file: Option<String>,
     env: Option<HashMap<String, String>>,
+    working_dir: Option<String>,
 }
 
 struct RunConfigRaw {
@@ -60,6 +61,7 @@ struct JobConfig {
     enabled: Option<bool>,
     env_file: Option<String>,
     env: Option<HashMap<String, String>>,
+    working_dir: Option<String>,
     webhook: Vec<WebhookConfig>,
 }
 
@@ -69,6 +71,7 @@ struct BuildConfig {
     timeout: Duration,    // Timeout for build (defaults to run.timeout)
     env_file: Option<String>,     // From build.env_file
     env: Option<HashMap<String, String>>,  // From build.env
+    working_dir: Option<String>,  // build.working_dir || job.working_dir
 }
 
 struct Job {
@@ -80,7 +83,7 @@ struct Job {
     timeout: Duration,    // From run.timeout
     concurrency: Concurrency,
     retry: Option<RetryConfig>,
-    working_dir: Option<String>,  // From run.working_dir
+    working_dir: Option<String>,  // run.working_dir || job.working_dir
     log_file: Option<String>,     // From log.file
     log_max_size: u64,            // From log.max_size
     env_file: Option<String>,     // Job-level (shared by build & run)
@@ -133,6 +136,7 @@ jobs:
     build:                   # Optional: build configuration
       sh: cargo build        # Build command (runs in build/ directory)
       timeout: 30m           # Optional: timeout for build (defaults to run.timeout)
+      working_dir: ./subdir  # Optional: working directory (relative to build dir)
     run:                     # Run configuration
       sh: ./target/debug/app # Run command (runs in run/ directory)
       timeout: 10s           # Optional (default: 1h)
@@ -146,6 +150,7 @@ jobs:
     log:                     # Optional: logging configuration
       file: output.log       # File path for stdout/stderr
       max_size: 10M          # Max size before rotation (default: 10M)
+    working_dir: ./subdir    # Optional: working directory for build & run (can be overridden)
     env_file: .env           # Optional: load env vars from file (relative to job dir)
     env:                     # Optional: inline env vars
       KEY: value
@@ -168,6 +173,15 @@ jobs:
 - Each run creates new directories with a random suffix (cleaned up on exit)
 - `build/` is a git worktree - gitignored files (build artifacts) are preserved between syncs
 - `run/` is copied from `build/` after successful build (excludes `.git`)
+
+## Toolchain
+
+[mise](https://mise.jdx.dev/) manages the Rust toolchain version (Rust 1.85).
+
+```bash
+mise exec -- cargo build    # Run cargo with mise-managed Rust
+mise exec -- cargo test     # Run tests
+```
 
 ## Assumptions
 
@@ -303,9 +317,9 @@ host ENV < runner.env_file < runner.env < job.env_file < job.env < run.env_file 
 ## Testing
 
 ```bash
-cargo test                    # Run all tests
-cargo run -- --help          # Check CLI
-cargo run -- . -i 10         # Test with local repo
+mise exec -- cargo test                    # Run all tests
+mise exec -- cargo run -- --help          # Check CLI
+mise exec -- cargo run -- . -i 10         # Test with local repo
 ```
 
 ## Common Modifications
