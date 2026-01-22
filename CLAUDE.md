@@ -182,45 +182,25 @@ Standard cron syntax is tried first; English is used as fallback.
 ### Full syntax (all options)
 
 ```yaml
-runner:                        # Optional: global settings
-  timezone: Asia/Tokyo         # Optional: IANA name, "inherit" (system), or omit for UTC
-  env_file: .env               # Optional: load env vars from file
-  env:                         # Optional: inline env vars
-    KEY: value
-  webhook:                     # Optional: failure notifications (inherited by all jobs)
-    - url: $DISCORD_WEBHOOK_URL  # URL or $ENV_VAR (loaded from runner.env_file)
-    - type: discord              # Optional: defaults to "discord"
-      url: https://discord.com/api/webhooks/...
+runner:
+  timezone: Asia/Tokyo         # IANA name, "inherit" (system), or omit for UTC
+  env_file: .env
+  env: { KEY: value }
+  webhook:
+    - url: $DISCORD_WEBHOOK_URL
 
 jobs:
-  <job-id>:                  # Key = ID (used for directories)
-    name: "Display Name"     # Optional (defaults to job-id)
-    schedule:                # String or object
-      cron: "*/5 * * * *"
-      timezone: Asia/Tokyo   # Optional: job-level timezone override
-    build:                   # Optional: string or object
-      sh: cargo build        # Build command (runs in build/ directory)
-      timeout: 30m           # Optional: timeout for build (defaults to run.timeout)
-      working_dir: ./subdir  # Optional: working directory (relative to build dir)
-    run:                     # String or object
-      sh: ./target/debug/app # Run command (runs in run/ directory)
-      timeout: 10s           # Optional (default: 1h)
-      concurrency: skip      # Optional: parallel|wait|skip|replace (default: skip)
-      working_dir: ./subdir  # Optional: working directory (relative to run dir)
-      retry:                 # Optional
-        max: 3               # Max retry attempts
-        delay: 1s            # Initial delay (default: 1s), exponential backoff
-        jitter: 500ms        # Optional: random variation 0-500ms added to retry delay
-                             # If omitted, auto-inferred as 25% of delay (e.g., 250ms for 1s delay)
-    log:                     # Optional: string or object
-      file: output.log       # File path for stdout/stderr
-      max_size: 10M          # Max size before rotation (default: 10M)
-    working_dir: ./subdir    # Optional: working directory for build & run (can be overridden)
-    env_file: .env           # Optional: load env vars from file (relative to job dir)
-    env:                     # Optional: inline env vars
-      KEY: value
-    webhook:                 # Optional: job-level webhooks (extend runner webhooks)
-      - url: https://...
+  <job-id>:
+    name: "Display Name"
+    schedule: { cron: "*/5 * * * *", timezone: Asia/Tokyo }
+    build: { sh: cargo build, timeout: 30m, working_dir: ./subdir }
+    run: { sh: ./app, timeout: 10s, concurrency: skip, working_dir: ./subdir,
+           retry: { max: 3, delay: 1s, jitter: 500ms } }
+    log: { file: output.log, max_size: 10M }
+    working_dir: ./subdir
+    env_file: .env
+    env: { KEY: value }
+    webhook: [{ url: https://... }]
 ```
 
 ## Runtime Directory Layout

@@ -15,6 +15,7 @@ cargo install --path .
 ```yaml
 jobs:
   hello:
+    name: "Hello World"
     schedule: "*/5 * * * *"
     run: echo "Hello from rollcron!"
 ```
@@ -33,21 +34,6 @@ rollcron https://github.com/user/repo --pull-interval 300
 ```
 
 ## Examples
-
-### Basic job with retry
-
-```yaml
-jobs:
-  backup:
-    name: "Daily Backup"
-    schedule: "0 2 * * *"
-    run:
-      sh: ./scripts/backup.sh
-      timeout: 5m
-      retry:
-        max: 3
-        delay: 10s
-```
 
 ### Human-readable schedules
 
@@ -167,6 +153,26 @@ Options:
       --pull-interval <SECS>  Pull interval in seconds [default: 3600]
 ```
 
+### Formats
+
+**Duration**: `500ms`, `30s`, `5m`, `1h`
+
+**Size**: `512K`, `10M`, `1G`, or bytes
+
+**Schedule**: Cron or English phrase
+
+- Cron: `min hour day month weekday` (e.g., `*/5 * * * *`)
+- English examples:
+  - `every 5 minutes`
+  - `every day at 16:00`
+  - `7pm every Thursday`
+  - `noon` / `midnight`
+
+Notes:
+- Time formats: `10 am`, `10:00 am`, `10:00` work; `10` alone does not
+- `every day` is optional: `noon` = `noon every day`
+- Avoid `12 am`/`12 pm` (confusing: 12 am = midnight, 12 pm = noon): use `noon`/`midnight` or `0:00`/`12:00`
+
 ### Configuration (`rollcron.yaml`)
 
 #### `runner` (optional)
@@ -258,26 +264,6 @@ Full form:
 |-------|------|-------------|
 | `type` | string, optional | Webhook type (default: `discord`) |
 | `url` | string | Webhook URL (supports `$VAR` expansion) |
-
-### Formats
-
-**Duration**: `500ms`, `30s`, `5m`, `1h`
-
-**Size**: `512K`, `10M`, `1G`, or bytes
-
-**Schedule**: Cron or English phrase
-
-- Cron: `min hour day month weekday` (e.g., `*/5 * * * *`)
-- English examples:
-  - `every 5 minutes`
-  - `every day at 16:00`
-  - `7pm every Thursday`
-  - `noon` / `midnight`
-
-Notes:
-- Minutes required: `at 12:00` works, `at 12` does not
-- `every day` is optional: `noon` = `noon every day`
-- Avoid `12 am`/`12 pm`: use `noon`/`midnight` or `0:00`/`12:00`
 
 ### Environment variable priority
 
