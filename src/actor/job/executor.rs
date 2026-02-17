@@ -1,21 +1,16 @@
 use chrono::{Local, Utc};
-use rand::Rng;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::process::Command;
-use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{Job, RetryConfig, RunnerConfig, TimezoneConfig};
+use crate::config::{Job, RunnerConfig, TimezoneConfig};
 use crate::env;
 use crate::git;
 use crate::webhook::{self, BuildFailure, JobFailure};
-
-/// Default jitter ratio when not explicitly configured (25% of base delay)
-const AUTO_JITTER_RATIO: u32 = 25;
 
 /// Grace period to wait after SIGTERM before sending SIGKILL
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -329,71 +324,39 @@ pub async fn execute_job(job: &Job, sot_path: &Path, runner: &RunnerConfig) -> b
         .as_ref()
         .and_then(|p| create_log_file(&job_dir, p, job.log_max_size));
 
-    let max_attempts = job.retry.as_ref().map(|r| r.max + 1).unwrap_or(1);
-    let mut last_result: Option<CommandResult> = None;
+    info!(
+        target: "rollcron::job",
+        job_id = %job.id,
+        name = %job.name,
+        command = %job.command,
+        "Starting job"
+    );
 
-    for attempt in 0..max_attempts {
-        if attempt > 0 {
-            if let Some(retry) = job.retry.as_ref() {
-                let delay = calculate_backoff(retry, attempt - 1);
-                info!(
-                    target: "rollcron::job",
-                    job_id = %job.id,
-                    attempt,
-                    max_retries = max_attempts - 1,
-                    delay = ?delay,
-                    "Retrying"
-                );
-                sleep(delay).await;
-            }
-        }
-
-        info!(
-            target: "rollcron::job",
-            job_id = %job.id,
-            name = %job.name,
-            command = %job.command,
-            "Starting job"
-        );
-
-        if let Some(ref mut file) = log_file {
-            let marker = if attempt > 0 {
-                format!("Job started (retry {}/{})", attempt, max_attempts - 1)
-            } else {
-                "Job started".to_string()
-            };
-            write_log_marker(file, &runner.timezone, job.timezone.as_ref(), &marker);
-        }
-
-        let start_time = Instant::now();
-        let result = run_command(job, &work_dir, sot_path, runner).await;
-        let duration = start_time.elapsed();
-        let success = handle_result(job, &result, log_file.as_mut(), &runner.timezone, duration);
-
-        if success {
-            return true;
-        }
-
-        last_result = Some(result);
-
-        if attempt + 1 < max_attempts {
-            debug!(target: "rollcron::job", job_id = %job.id, "Will retry...");
-        }
+    if let Some(ref mut file) = log_file {
+        write_log_marker(file, &runner.timezone, job.timezone.as_ref(), "Job started");
     }
 
-    // All retries exhausted - send webhook notifications if configured
+    let start_time = Instant::now();
+    let result = run_command(job, &work_dir, sot_path, runner).await;
+    let duration = start_time.elapsed();
+    let success = handle_result(job, &result, log_file.as_mut(), &runner.timezone, duration);
+
+    if success {
+        return true;
+    }
+
+    // Job failed - send webhook notifications if configured
     if !job.webhook.is_empty() {
-        let (error, stderr) = match &last_result {
-            Some(CommandResult::Completed(output)) => {
+        let (error, stderr) = match &result {
+            CommandResult::Completed(output) => {
                 let err = format!("exit code {:?}", output.status.code());
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
                 (err, stderr)
             }
-            Some(CommandResult::ExecError(e)) => (format!("exec error: {}", e), String::new()),
-            Some(CommandResult::Timeout) => {
+            CommandResult::ExecError(e) => (format!("exec error: {}", e), String::new()),
+            CommandResult::Timeout => {
                 (format!("timeout after {:?}", job.timeout), String::new())
             }
-            None => ("unknown error".to_string(), String::new()),
         };
 
         let failure = JobFailure {
@@ -401,7 +364,7 @@ pub async fn execute_job(job: &Job, sot_path: &Path, runner: &RunnerConfig) -> b
             job_name: &job.name,
             error,
             stderr,
-            attempts: max_attempts,
+            attempts: 1,
         };
 
         let runner_env = load_runner_env_vars(sot_path, runner);
@@ -714,27 +677,6 @@ fn handle_result(job: &Job, result: &CommandResult, log_file: Option<&mut File>,
     }
 }
 
-// === Backoff ===
-
-fn calculate_backoff(retry: &RetryConfig, attempt: u32) -> Duration {
-    let base_delay = retry.delay.saturating_mul(2u32.saturating_pow(attempt));
-    let jitter_max =
-        retry.jitter.unwrap_or_else(|| retry.delay.saturating_mul(AUTO_JITTER_RATIO) / 100);
-    base_delay.saturating_add(generate_jitter(jitter_max))
-}
-
-fn generate_jitter(max: Duration) -> Duration {
-    if max.is_zero() {
-        return Duration::ZERO;
-    }
-    let millis = max.as_millis();
-    if millis == 0 {
-        return Duration::ZERO;
-    }
-    let jitter_millis = rand::thread_rng().gen_range(0..=millis);
-    Duration::from_millis(jitter_millis as u64)
-}
-
 // === Logging ===
 
 fn rotate_log_file(path: &Path, max_size: u64) {
@@ -819,7 +761,6 @@ mod tests {
             command: cmd.to_string(),
             timeout: Duration::from_secs(timeout_secs),
             concurrency: Concurrency::Skip,
-            retry: None,
             working_dir: None,
             enabled: true,
             timezone: None,
@@ -856,37 +797,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let runner = make_runner();
         execute_job(&job, &dir.path().to_path_buf(), &runner).await;
-    }
-
-    #[test]
-    fn exponential_backoff_calculation() {
-        let retry = RetryConfig {
-            max: 5,
-            delay: Duration::from_secs(1),
-            jitter: None,
-        };
-        let backoff_0 = calculate_backoff(&retry, 0);
-        assert!(backoff_0 >= Duration::from_secs(1));
-        assert!(backoff_0 <= Duration::from_millis(1250));
-
-        let backoff_1 = calculate_backoff(&retry, 1);
-        assert!(backoff_1 >= Duration::from_secs(2));
-        assert!(backoff_1 <= Duration::from_millis(2250));
-    }
-
-    #[test]
-    fn generate_jitter_bounds() {
-        let max = Duration::from_millis(100);
-        for _ in 0..10 {
-            let jitter = generate_jitter(max);
-            assert!(jitter <= max);
-        }
-    }
-
-    #[test]
-    fn generate_jitter_zero() {
-        let jitter = generate_jitter(Duration::ZERO);
-        assert_eq!(jitter, Duration::ZERO);
     }
 
     #[test]

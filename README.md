@@ -121,10 +121,6 @@ jobs:
       timeout: 5m
       concurrency: skip
       working_dir: ./dist
-      retry:
-        max: 3
-        delay: 5s
-        jitter: 1s
       env_file: .env.run
       env:
         NODE_ENV: production
@@ -238,14 +234,6 @@ Full form:
 | `working_dir` | string, optional | job's | Working directory (relative to run dir) |
 | `env_file` | string, optional | - | Run-specific .env file |
 | `env` | map, optional | - | Run-specific environment variables |
-
-#### `jobs.<job-id>.run.retry` (optional)
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `max` | int | **required** | Max retry attempts (must be ≥ 1) |
-| `delay` | duration, optional | `1s` | Initial delay (doubles each retry) |
-| `jitter` | duration, optional | 25% of delay | Random variation added to delay |
 
 #### `jobs.<job-id>.log` (optional)
 

@@ -146,7 +146,6 @@ pub struct RunConfigFull {
     pub timeout: String,
     #[serde(default)]
     pub concurrency: Concurrency,
-    pub retry: Option<RetryConfigRaw>,
     pub working_dir: Option<String>,
     pub env_file: Option<String>,
     pub env: Option<HashMap<String, String>>,
@@ -182,19 +181,6 @@ pub struct JobConfig {
     pub working_dir: Option<String>,
     #[serde(default)]
     pub webhook: Vec<WebhookConfig>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RetryConfigRaw {
-    #[serde(default)]
-    pub max: u32,
-    #[serde(default = "default_retry_delay")]
-    pub delay: String,
-    pub jitter: Option<String>,
-}
-
-fn default_retry_delay() -> String {
-    "1s".to_string()
 }
 
 /// Schedule configuration - supports shorthand string or full object
@@ -239,7 +225,6 @@ pub struct Job {
     pub command: String,
     pub timeout: Duration,
     pub concurrency: Concurrency,
-    pub retry: Option<RetryConfig>,
     pub working_dir: Option<String>,
     pub enabled: bool,
     pub timezone: Option<TimezoneConfig>,
@@ -250,13 +235,6 @@ pub struct Job {
     pub webhook: Vec<WebhookConfig>,
     pub log_file: Option<String>,
     pub log_max_size: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct RetryConfig {
-    pub max: u32,
-    pub delay: Duration,
-    pub jitter: Option<Duration>,
 }
 
 pub fn parse_config(content: &str) -> Result<(RunnerConfig, Vec<Job>)> {
@@ -316,14 +294,13 @@ fn parse_job(
     let schedule = parse_schedule(&cron_expr)?;
 
     // Extract run config
-    let (run_sh, run_timeout, run_concurrency, run_retry, run_working_dir, run_env_file, run_env) =
+    let (run_sh, run_timeout, run_concurrency, run_working_dir, run_env_file, run_env) =
         match job.run {
-            RunConfigRaw::Simple(sh) => (sh, default_timeout(), Concurrency::default(), None, None, None, None),
+            RunConfigRaw::Simple(sh) => (sh, default_timeout(), Concurrency::default(), None, None, None),
             RunConfigRaw::Full(full) => (
                 full.sh,
                 full.timeout,
                 full.concurrency,
-                full.retry,
                 full.working_dir,
                 full.env_file,
                 full.env,
@@ -356,27 +333,6 @@ fn parse_job(
         .transpose()?;
 
     let name = job.name.unwrap_or_else(|| id.to_string());
-
-    let retry = run_retry
-        .map(|r| {
-            if r.max == 0 {
-                anyhow::bail!(
-                    "Invalid retry.max '0': must be at least 1 (use no retry config to disable retries)"
-                );
-            }
-            let delay = parse_duration(&r.delay)
-                .map_err(|e| anyhow!("Invalid retry delay '{}': {}", r.delay, e))?;
-            let jitter = r
-                .jitter
-                .map(|j| parse_duration(&j).map_err(|e| anyhow!("Invalid retry jitter '{}': {}", j, e)))
-                .transpose()?;
-            Ok::<_, anyhow::Error>(RetryConfig {
-                max: r.max,
-                delay,
-                jitter,
-            })
-        })
-        .transpose()?;
 
     let job_timezone = schedule_timezone
         .map(|tz| {
@@ -413,7 +369,6 @@ fn parse_job(
         command: run_sh,
         timeout,
         concurrency: run_concurrency,
-        retry,
         working_dir: run_working_dir.or(job.working_dir),
         enabled: job.enabled.unwrap_or(true),
         timezone: job_timezone,
@@ -619,52 +574,6 @@ jobs:
     }
 
     #[test]
-    fn parse_retry_config() {
-        let yaml = r#"
-jobs:
-  with_retry:
-    schedule:
-      cron: "* * * * *"
-    run:
-      sh: echo test
-      retry:
-        max: 3
-        delay: 2s
-  no_retry:
-    schedule:
-      cron: "* * * * *"
-    run:
-      sh: echo test
-"#;
-        let (_, jobs) = parse_config(yaml).unwrap();
-        let find = |id: &str| jobs.iter().find(|j| j.id == id).unwrap();
-
-        let retry = find("with_retry").retry.as_ref().unwrap();
-        assert_eq!(retry.max, 3);
-        assert_eq!(retry.delay, Duration::from_secs(2));
-
-        assert!(find("no_retry").retry.is_none());
-    }
-
-    #[test]
-    fn parse_retry_default_delay() {
-        let yaml = r#"
-jobs:
-  test:
-    schedule:
-      cron: "* * * * *"
-    run:
-      sh: echo test
-      retry:
-        max: 2
-"#;
-        let (_, jobs) = parse_config(yaml).unwrap();
-        let retry = jobs[0].retry.as_ref().unwrap();
-        assert_eq!(retry.max, 2);
-        assert_eq!(retry.delay, Duration::from_secs(1)); // default delay
-    }
-
-    #[test]
     fn parse_runner_config() {
         let yaml = r#"
 runner:
@@ -812,38 +721,6 @@ jobs:
     }
 
     #[test]
-    fn parse_retry_jitter() {
-        let yaml = r#"
-jobs:
-  with_retry_jitter:
-    schedule:
-      cron: "* * * * *"
-    run:
-      sh: echo test
-      retry:
-        max: 3
-        delay: 1s
-        jitter: 500ms
-  retry_no_jitter:
-    schedule:
-      cron: "* * * * *"
-    run:
-      sh: echo test
-      retry:
-        max: 2
-        delay: 1s
-"#;
-        let (_, jobs) = parse_config(yaml).unwrap();
-        let find = |id: &str| jobs.iter().find(|j| j.id == id).unwrap();
-
-        let retry1 = find("with_retry_jitter").retry.as_ref().unwrap();
-        assert_eq!(retry1.jitter, Some(Duration::from_millis(500)));
-
-        let retry2 = find("retry_no_jitter").retry.as_ref().unwrap();
-        assert!(retry2.jitter.is_none());
-    }
-
-    #[test]
     fn parse_duration_milliseconds() {
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
         assert_eq!(
@@ -892,22 +769,6 @@ jobs:
 "#;
         let (_, jobs) = parse_config(yaml).unwrap();
         assert_eq!(jobs[0].id, "my-job_123");
-    }
-
-    #[test]
-    fn skip_retry_max_zero() {
-        let yaml = r#"
-jobs:
-  test:
-    schedule:
-      cron: "* * * * *"
-    run:
-      sh: echo test
-      retry:
-        max: 0
-"#;
-        let (_, jobs) = parse_config(yaml).unwrap();
-        assert!(jobs.is_empty()); // Invalid job is skipped
     }
 
     #[test]

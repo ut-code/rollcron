@@ -17,7 +17,7 @@ src/
 │   └── job/                # Job Actor - single job control
 │       ├── mod.rs          # Actor definition, state machine
 │       ├── tick.rs         # cron schedule evaluation
-│       └── executor.rs     # command execution, retry, timeout
+│       └── executor.rs     # command execution, timeout
 ├── config.rs               # YAML config parsing, Job struct
 ├── git.rs                  # Git operations (clone, pull, archive)
 ├── env.rs                  # Environment variable handling
@@ -53,7 +53,6 @@ enum RunConfigRaw {
         sh: String,
         timeout: String,       // Default: "1h"
         concurrency: Concurrency,
-        retry: Option<RetryConfigRaw>,
         working_dir: Option<String>,
         env_file: Option<String>,
         env: Option<HashMap<String, String>>,
@@ -98,7 +97,6 @@ struct Job {
     command: String,      // From run.sh
     timeout: Duration,    // From run.timeout
     concurrency: Concurrency,
-    retry: Option<RetryConfig>,
     working_dir: Option<String>,  // run.working_dir || job.working_dir
     log_file: Option<String>,     // From log.file
     log_max_size: u64,            // From log.max_size
@@ -112,13 +110,6 @@ struct Job {
 struct WebhookConfig {
     webhook_type: String,  // Currently only "discord" (default)
     url: String,           // Webhook URL (supports $ENV_VAR expansion)
-}
-
-struct RetryConfig {
-    max: u32,             // Max retry attempts
-    delay: Duration,      // Initial delay (exponential backoff)
-    jitter: Option<Duration>,  // Random variation added to retry delay (0 to jitter)
-                               // Auto-inferred as 25% of delay when not set
 }
 
 struct RunnerConfig {
@@ -194,8 +185,7 @@ jobs:
     name: "Display Name"
     schedule: { cron: "*/5 * * * *", timezone: Asia/Tokyo }
     build: { sh: cargo build, timeout: 30m, working_dir: ./subdir }
-    run: { sh: ./app, timeout: 10s, concurrency: skip, working_dir: ./subdir,
-           retry: { max: 3, delay: 1s, jitter: 500ms } }
+    run: { sh: ./app, timeout: 10s, concurrency: skip, working_dir: ./subdir }
     log: { file: output.log, max_size: 10M }
     working_dir: ./subdir
     env_file: .env
@@ -260,7 +250,7 @@ mise exec -- cargo test     # Run tests
 ### Job Execution
 1. Each job calculates next occurrence and sleeps until scheduled time
 2. When scheduled time arrives: spawn task in run/ directory with timeout
-3. On failure: apply exponential backoff + retry jitter before retry
+3. On failure: send webhook notification
 4. After job completes: try to copy pending build if any
 
 ### Shutdown (Ctrl+C)
