@@ -405,14 +405,52 @@ pub fn copy_build_to_run(build_dir: &Path, run_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Discovers job directories by scanning the filesystem for `<sot_name>@*` entries.
+/// Used as a fallback when the actor system can't provide job IDs.
+pub fn discover_job_dirs(sot_path: &Path) -> Vec<PathBuf> {
+    let Some(parent) = sot_path.parent() else {
+        return Vec::new();
+    };
+    let sot_name = sot_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+    let prefix = format!("{}@", sot_name);
+
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix))
+        })
+        .map(|e| e.path())
+        .collect()
+}
+
 /// Removes the sot_path and all associated job directories.
+/// If `job_ids` is empty, falls back to filesystem discovery.
 pub fn cleanup_cache_dir(sot_path: &Path, job_ids: &[String]) {
     use tracing::{info, warn};
 
+    // Determine job directories: use provided IDs if available, otherwise scan filesystem
+    let job_dirs: Vec<PathBuf> = if job_ids.is_empty() {
+        let discovered = discover_job_dirs(sot_path);
+        if !discovered.is_empty() {
+            info!("Discovered {} job directories via filesystem scan", discovered.len());
+        }
+        discovered
+    } else {
+        job_ids.iter().map(|id| get_job_dir(sot_path, id)).collect()
+    };
+
     // Remove job directories
-    for job_id in job_ids {
-        let job_dir = get_job_dir(sot_path, job_id);
-        let build_dir = get_build_dir(sot_path, job_id);
+    for job_dir in &job_dirs {
+        let build_dir = job_dir.join("build");
 
         // Remove git worktree first (if it exists)
         if build_dir.join(".git").exists() {
@@ -429,11 +467,11 @@ pub fn cleanup_cache_dir(sot_path: &Path, job_ids: &[String]) {
 
         if job_dir.exists() {
             info!(path = %job_dir.display(), "Removing job directory");
-            let _ = std::fs::remove_dir_all(&job_dir);
+            let _ = std::fs::remove_dir_all(job_dir);
         }
 
         // Also remove temp/old variants for run dir
-        let run_dir = get_run_dir(sot_path, job_id);
+        let run_dir = job_dir.join("run");
         let _ = std::fs::remove_dir_all(run_dir.with_extension("tmp"));
         let _ = std::fs::remove_dir_all(run_dir.with_extension("old"));
     }

@@ -26,6 +26,58 @@ struct Args {
     pull_interval: u64,
 }
 
+/// RAII guard that cleans up cache directories on drop.
+struct CacheGuard {
+    sot_path: PathBuf,
+    job_ids: Vec<String>,
+}
+
+impl CacheGuard {
+    fn new(sot_path: PathBuf) -> Self {
+        Self {
+            sot_path,
+            job_ids: Vec::new(),
+        }
+    }
+
+    fn set_job_ids(&mut self, ids: Vec<String>) {
+        self.job_ids = ids;
+    }
+
+    /// Disarm the guard (cleanup already handled manually).
+    #[allow(dead_code)]
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for CacheGuard {
+    fn drop(&mut self) {
+        git::cleanup_cache_dir(&self.sot_path, &self.job_ids);
+    }
+}
+
+/// Waits for either SIGINT (Ctrl+C) or SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     logging::init();
@@ -50,6 +102,9 @@ async fn main() -> Result<()> {
     git::clone_to(&source, &sot_path)?;
     info!(cache = %sot_path.display(), "Repository ready");
 
+    // RAII guard ensures sot_path is cleaned up even on early exit
+    let mut cache_guard = CacheGuard::new(sot_path.clone());
+
     let (initial_runner, initial_jobs) = load_config(&sot_path)?;
 
     // Spawn Runner actor
@@ -68,18 +123,20 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Wait for shutdown signal
-    tokio::signal::ctrl_c().await?;
+    // Wait for shutdown signal (SIGINT or SIGTERM)
+    shutdown_signal().await;
     info!("Shutting down...");
 
-    // Get job IDs for cleanup
+    // Get job IDs for cleanup (fall back to filesystem scan if actor is dead)
     let job_ids = runner.send(GetJobIds).await.unwrap_or_default();
+    cache_guard.set_job_ids(job_ids);
 
     // Graceful shutdown
     let _ = runner.send(GracefulShutdown).await;
 
-    // Cleanup cache directories
-    git::cleanup_cache_dir(&sot_path, &job_ids);
+    // Cleanup via guard drop (disarm and run manually to log any issues)
+    // The guard will run cleanup in its Drop, so just let it go out of scope.
+    drop(cache_guard);
 
     Ok(())
 }
