@@ -62,6 +62,7 @@ impl JobActor {
     }
 
     fn try_copy(&mut self) -> anyhow::Result<bool> {
+        self.cleanup_finished_handles();
         if self.pending_copy && self.running_count() == 0 {
             info!(target: "rollcron::job", job_id = %self.job.id, "Copying build to run directory");
             let build_dir = git::get_build_dir(&self.sot_path, &self.job.id);

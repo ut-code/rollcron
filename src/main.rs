@@ -22,7 +22,7 @@ struct Args {
     repo: String,
 
     /// Pull interval in seconds
-    #[arg(long, default_value = "3600")]
+    #[arg(short = 'i', long, default_value = "3600")]
     pull_interval: u64,
 }
 
